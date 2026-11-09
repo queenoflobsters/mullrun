@@ -1,0 +1,2092 @@
+#!/usr/bin/env python3
+"""vpn-run: on-demand, reference-counted, auto-closing WireGuard launcher.
+
+The launcher wraps ``wgc`` and starts applications inside the network
+namespace created by ``wgc nup``.  A detached supervisor holds the life-cycle
+lock, watches the kernel reference locks and the namespace PID set, and tears
+the namespace down after a configurable idle grace period.
+
+Only the Python standard library is used.
+"""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import json
+import os
+import pwd
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+PROG = "vpn-run"
+VERSION = "1.0.0"
+DEFAULT_VPN = "mullvad"
+DEFAULT_GRACE = 5
+DEFAULT_LOCK_TIMEOUT = 60
+MAX_GRACE = 3600
+MAX_LOCK_TIMEOUT = 300
+NAMESPACE_PREFIX = "wgc_"
+WGC_DEFAULT = "/usr/local/bin/wgc"
+IP_CANDIDATES = ("/usr/bin/ip", "/sbin/ip", "/usr/sbin/ip", "/bin/ip")
+SUDO_CANDIDATES = ("/usr/bin/sudo", "/bin/sudo", "/usr/local/bin/sudo")
+VPN_RE = re.compile(r"^[A-Za-z0-9_-]{1,16}$")
+POLL_INTERVAL = 0.5
+LOG_MAX_BYTES = 1024 * 1024
+
+
+class VpnRunError(Exception):
+    """Expected, user-facing failure."""
+
+
+class UsageError(VpnRunError):
+    """Invalid command line."""
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+def _stream_colors(stream: Any) -> bool:
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if os.environ.get("TERM", "") == "dumb":
+        return False
+    try:
+        return bool(stream.isatty())
+    except Exception:
+        return False
+
+
+def _paint(text: str, code: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return "\033[%sm%s\033[0m" % (code, text)
+
+
+def _log(prefix: str, color: str, message: str) -> None:
+    enabled = _stream_colors(sys.stderr)
+    label = _paint("[%s]" % PROG, color, enabled)
+    print("%s %s" % (label, message), file=sys.stderr, flush=True)
+
+
+def log_info(message: str) -> None:
+    _log("info", "1;34", message)
+
+
+def log_warn(message: str) -> None:
+    _log("warn", "1;33", message)
+
+
+def log_error(message: str) -> None:
+    _log("error", "1;31", message)
+
+
+def log_debug(message: str) -> None:
+    if os.environ.get("VPN_RUN_DEBUG") == "1":
+        _log("debug", "0;36", message)
+
+
+def color_stdout(text: str, code: str) -> str:
+    return _paint(text, code, _stream_colors(sys.stdout))
+
+
+# ---------------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------------
+
+def is_test_mode() -> bool:
+    """Internal test hook.  It never enables privilege elevation."""
+    return os.environ.get("VPN_RUN_TEST_MODE") == "1"
+
+
+def validate_vpn_name(name: str) -> str:
+    if not isinstance(name, str) or not VPN_RE.match(name):
+        raise UsageError(
+            "Invalid VPN name %r. Use 1-16 characters from A-Z, a-z, 0-9, "
+            "'-' or '_'." % (name,)
+        )
+    return name
+
+
+def namespace_name(vpn: str) -> str:
+    return NAMESPACE_PREFIX + vpn
+
+
+def parse_bounded_int(value: str, what: str, low: int, high: int) -> int:
+    try:
+        number = int(value, 10)
+    except (TypeError, ValueError):
+        raise UsageError("%s must be an integer." % what)
+    if number < low or number > high:
+        raise UsageError("%s must be between %d and %d." % (what, low, high))
+    return number
+
+
+def grace_from_env(default: int = DEFAULT_GRACE) -> int:
+    raw = os.environ.get("VPN_RUN_GRACE_PERIOD")
+    if raw is None or raw == "":
+        return default
+    return parse_bounded_int(raw, "VPN_RUN_GRACE_PERIOD", 0, MAX_GRACE)
+
+
+def lock_timeout_from_env() -> int:
+    raw = os.environ.get("VPN_RUN_LOCK_TIMEOUT")
+    if raw is None or raw == "":
+        return DEFAULT_LOCK_TIMEOUT
+    return parse_bounded_int(raw, "VPN_RUN_LOCK_TIMEOUT", 1, MAX_LOCK_TIMEOUT)
+
+
+def default_vpn_from_env() -> str:
+    raw = os.environ.get("VPN_RUN_DEFAULT_VPN") or DEFAULT_VPN
+    return validate_vpn_name(raw)
+
+
+def read_boot_id() -> str:
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "r", encoding="ascii") as fh:
+            return fh.read().strip()
+    except OSError:
+        return "unknown"
+
+
+def proc_start_time(pid: int) -> Optional[int]:
+    """Return field 22 (starttime) from /proc/PID/stat, or None."""
+    try:
+        with open("/proc/%d/stat" % pid, "r", encoding="utf-8", errors="replace") as fh:
+            data = fh.read()
+        close = data.rfind(")")
+        if close < 0:
+            return None
+        fields = data[close + 2:].split()
+        # fields[0] is field 3; starttime is field 22 -> index 19.
+        return int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        with open("/proc/%d/stat" % pid, "r", encoding="utf-8", errors="replace") as fh:
+            data = fh.read()
+        close = data.rfind(")")
+        if close >= 0:
+            fields = data[close + 2:].split()
+            if fields and fields[0] == "Z":
+                return False
+    except OSError:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def process_cmdline(pid: int) -> List[str]:
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            raw = fh.read(1024 * 1024)
+    except OSError:
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+def looks_like_supervisor(pid: int, vpn: str) -> bool:
+    args = process_cmdline(pid)
+    if "--internal-supervisor" not in args:
+        return False
+    try:
+        index = args.index("--internal-supervisor")
+    except ValueError:
+        return False
+    return index + 1 < len(args) and args[index + 1] == vpn
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return "%dd %02dh %02dm" % (days, hours, minutes)
+    if hours:
+        return "%dh %02dm" % (hours, minutes)
+    if minutes:
+        return "%dm %02ds" % (minutes, secs)
+    return "%ds" % secs
+
+
+def run_command(cmd: Sequence[str], timeout: int, capture: bool = True) -> subprocess.CompletedProcess:
+    """Run a command, converting common OSError cases into clear errors."""
+    log_debug("exec: %s" % shlex.join(list(cmd)))
+    try:
+        return subprocess.run(
+            list(cmd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            close_fds=True,
+        )
+    except FileNotFoundError:
+        raise VpnRunError("Required command not found: %s" % cmd[0])
+    except PermissionError:
+        raise VpnRunError("Permission denied while executing: %s" % cmd[0])
+    except subprocess.TimeoutExpired:
+        raise VpnRunError("Command timed out after %ds: %s" % (timeout, shlex.join(list(cmd))))
+
+
+def run_text(cmd: Sequence[str], timeout: int) -> Tuple[int, str, str]:
+    cp = run_command(cmd, timeout=timeout, capture=True)
+    return cp.returncode, cp.stdout or "", cp.stderr or ""
+
+
+def sudo_failure(stderr: str) -> bool:
+    text = (stderr or "").lower()
+    needles = (
+        "password is required",
+        "a terminal is required",
+        "no tty present",
+        "no askpass program",
+        "sudo:",
+    )
+    return any(needle in text for needle in needles)
+
+
+def sudo_hint() -> str:
+    return (
+        "Passwordless sudo for /usr/local/bin/wgc and /usr/bin/ip is required. "
+        "Re-run ./install.sh as root to install /etc/sudoers.d/vpn-run-nopasswd."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Privilege handling
+# ---------------------------------------------------------------------------
+
+def _default_desktop_env(uid: int, home: str) -> Dict[str, str]:
+    updates: Dict[str, str] = {}
+    candidates = [os.environ.get("XDG_RUNTIME_DIR", ""), "/run/user/%d" % uid]
+    runtime = ""
+    for candidate in candidates:
+        if not candidate or not os.path.isabs(candidate):
+            continue
+        try:
+            st = os.lstat(candidate)
+        except OSError:
+            continue
+        if (
+            stat.S_ISDIR(st.st_mode)
+            and not stat.S_ISLNK(st.st_mode)
+            and st.st_uid == uid
+        ):
+            runtime = candidate
+            break
+    if runtime:
+        updates["XDG_RUNTIME_DIR"] = runtime
+        bus = os.path.join(runtime, "bus")
+        if os.path.exists(bus) and not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+            updates["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=%s" % bus
+    if not os.environ.get("WAYLAND_DISPLAY") and runtime:
+        try:
+            for entry in sorted(os.listdir(runtime)):
+                if entry.startswith("wayland-") and not entry.endswith(".lock"):
+                    updates["WAYLAND_DISPLAY"] = entry
+                    break
+        except OSError:
+            pass
+    if not os.environ.get("DISPLAY") and os.path.exists("/tmp/.X11-unix/X0"):
+        updates["DISPLAY"] = ":0"
+    updates.setdefault("HOME", home)
+    updates.setdefault("PWD", os.getcwd())
+    return updates
+
+
+def prepare_environment() -> None:
+    """Ensure the desktop/session variables survive all sudo boundaries.
+
+    ``wgc exec`` deliberately reconstructs the environment from the process
+    that invoked sudo (this launcher), then drops privileges with setpriv.
+    Adding missing defaults here therefore preserves Wayland/X11, D-Bus and
+    audio sockets for the application.
+    """
+    uid = os.geteuid()
+    try:
+        record = pwd.getpwuid(uid)
+        home = record.pw_dir
+        user = record.pw_name
+        shell = record.pw_shell or "/bin/sh"
+    except KeyError:
+        home = os.environ.get("HOME", "/")
+        user = os.environ.get("USER", str(uid))
+        shell = os.environ.get("SHELL", "/bin/sh")
+
+    updates = _default_desktop_env(uid, home)
+    for key, value in updates.items():
+        if not os.environ.get(key):
+            os.environ[key] = value
+    # A stale XDG_RUNTIME_DIR (for example /run/user/0 after an outer sudo)
+    # must not be passed to a GUI application.
+    current_xdg = os.environ.get("XDG_RUNTIME_DIR", "")
+    if current_xdg:
+        valid_xdg = False
+        try:
+            st = os.lstat(current_xdg)
+            valid_xdg = (
+                os.path.isabs(current_xdg)
+                and stat.S_ISDIR(st.st_mode)
+                and not stat.S_ISLNK(st.st_mode)
+                and st.st_uid == uid
+            )
+        except OSError:
+            valid_xdg = False
+        if not valid_xdg and updates.get("XDG_RUNTIME_DIR"):
+            os.environ["XDG_RUNTIME_DIR"] = updates["XDG_RUNTIME_DIR"]
+    os.environ.setdefault("USER", user)
+    os.environ.setdefault("LOGNAME", user)
+    os.environ.setdefault("SHELL", shell)
+    os.environ.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    os.environ["PWD"] = os.getcwd()
+
+
+def ensure_unprivileged() -> None:
+    """Refuse to run the app as root.
+
+    ``install.sh`` is the only component that should run as root.  If a user
+    invokes ``sudo vpn-run``, drop back to the original sudo user *before*
+    touching runtime state so the inner ``wgc exec`` sees a normal user and
+    performs its setpriv drop correctly.
+    """
+    if os.geteuid() != 0 or is_test_mode():
+        prepare_environment()
+        return
+
+    sudo_uid = os.environ.get("SUDO_UID")
+    sudo_gid = os.environ.get("SUDO_GID")
+    if not sudo_uid:
+        raise VpnRunError(
+            "Do not run vpn-run as root. Run it as your desktop user; it will "
+            "use sudo only for wgc and ip."
+        )
+    try:
+        uid = int(sudo_uid)
+    except ValueError:
+        raise VpnRunError("Invalid SUDO_UID value; cannot drop privileges.")
+    if uid == 0:
+        raise VpnRunError("Refusing to launch applications as root.")
+    try:
+        record = pwd.getpwuid(uid)
+    except KeyError:
+        raise VpnRunError("SUDO_UID %d does not correspond to a local user." % uid)
+    gid = int(sudo_gid) if sudo_gid and sudo_gid.isdigit() else record.pw_gid
+
+    try:
+        os.initgroups(record.pw_name, gid)
+        os.setgid(gid)
+        os.setuid(uid)
+    except OSError as exc:
+        raise VpnRunError("Failed to drop privileges to UID %d: %s" % (uid, exc))
+    if os.geteuid() != uid:
+        raise VpnRunError("Privilege drop verification failed; refusing to continue.")
+
+    os.environ["HOME"] = record.pw_dir
+    os.environ["USER"] = record.pw_name
+    os.environ["LOGNAME"] = record.pw_name
+    os.environ["SHELL"] = record.pw_shell or "/bin/sh"
+    # Do not retain a root-owned XDG runtime directory from the outer sudo.
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not xdg or xdg == "/run/user/0":
+        os.environ.pop("XDG_RUNTIME_DIR", None)
+    prepare_environment()
+    log_debug("dropped privileges to %s (UID %d, GID %d)" % (record.pw_name, uid, gid))
+
+
+def sync_environment_and_reexec(argv: Sequence[str]) -> None:
+    """Make the final environment visible in /proc/PID/environ.
+
+    wgc exec reconstructs the GUI environment from the *unsanitised*
+    environment of the process that invoked sudo (this launcher).  Linux
+    exposes the initial environment block through /proc/PID/environ, not
+    later os.environ changes, so re-exec once after applying session defaults
+    (and after a possible root-to-user privilege drop).  execve keeps the PID,
+    so process supervision and shell job control are unaffected.
+    """
+    if os.environ.get("VPN_RUN_ENV_READY") == "1":
+        return
+    os.environ["VPN_RUN_ENV_READY"] = "1"
+    script = os.path.realpath(__file__)
+    python = sys.executable or shutil.which("python3") or "/usr/bin/python3"
+    try:
+        os.execve(python, [python, script] + list(argv), dict(os.environ))
+    except OSError as exc:
+        log_debug("environment re-exec failed (%s); continuing" % exc)
+
+
+# ---------------------------------------------------------------------------
+# Runtime paths, secure files and locks
+# ---------------------------------------------------------------------------
+
+def _secure_dir(path: str) -> None:
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise VpnRunError("Cannot create runtime directory %s: %s" % (path, exc))
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise VpnRunError("Cannot stat runtime directory %s: %s" % (path, exc))
+    if stat.S_ISLNK(st.st_mode):
+        raise VpnRunError("Refusing symlinked runtime directory: %s" % path)
+    if not stat.S_ISDIR(st.st_mode):
+        raise VpnRunError("Runtime path is not a directory: %s" % path)
+    if st.st_uid != os.geteuid():
+        raise VpnRunError(
+            "Runtime directory %s is not owned by UID %d." % (path, os.geteuid())
+        )
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        try:
+            os.chmod(path, 0o700)
+        except OSError as exc:
+            raise VpnRunError("Cannot secure runtime directory %s: %s" % (path, exc))
+
+
+def resolve_runtime_root() -> str:
+    uid = os.geteuid()
+    if is_test_mode():
+        override = os.environ.get("VPN_RUN_RUNTIME_DIR")
+        if override:
+            if not os.path.isabs(override):
+                raise VpnRunError("VPN_RUN_RUNTIME_DIR must be an absolute path.")
+            _secure_dir(override)
+            return override
+
+    candidates: List[str] = []
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        candidates.append(xdg)
+    candidates.append("/run/user/%d" % uid)
+    base: Optional[str] = None
+    for candidate in candidates:
+        if not candidate or not os.path.isabs(candidate):
+            continue
+        try:
+            st = os.lstat(candidate)
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            continue
+        if st.st_uid != uid:
+            continue
+        base = candidate
+        break
+    if not base:
+        raise VpnRunError(
+            "No secure XDG_RUNTIME_DIR available for UID %d. Log in through a "
+            "systemd user session (or set XDG_RUNTIME_DIR to a private, "
+            "user-owned directory)." % uid
+        )
+    root = os.path.join(base, PROG)
+    _secure_dir(root)
+    return root
+
+
+class Layout:
+    """Paths for one VPN's persistent locks and transient state."""
+
+    def __init__(self, runtime_root: str, vpn: str):
+        self.root = runtime_root
+        self.vpn = vpn
+        self.locks_dir = os.path.join(runtime_root, "locks")
+        self.logs_dir = os.path.join(runtime_root, "logs")
+        self.state_root = os.path.join(runtime_root, "state")
+        self.state_dir = os.path.join(self.state_root, vpn)
+        self.refs_dir = os.path.join(self.state_dir, "refs")
+        self.ref_lock = os.path.join(self.locks_dir, "%s.ref.lock" % vpn)
+        self.supervisor_lock = os.path.join(self.locks_dir, "%s.supervisor.lock" % vpn)
+        self.lifecycle_lock = os.path.join(self.locks_dir, "%s.lifecycle.lock" % vpn)
+        self.log_file = os.path.join(self.logs_dir, "%s.log" % vpn)
+        self.state_file = os.path.join(self.state_dir, "state.json")
+        self.pid_file = os.path.join(self.state_dir, "supervisor.pid")
+
+    def ensure(self, with_state: bool = True) -> None:
+        _secure_dir(self.root)
+        _secure_dir(self.locks_dir)
+        _secure_dir(self.logs_dir)
+        _secure_dir(self.state_root)
+        if with_state:
+            _secure_dir(self.state_dir)
+            _secure_dir(self.refs_dir)
+
+
+def open_lock_file(path: str) -> int:
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise VpnRunError("Cannot open lock file %s: %s" % (path, exc))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise VpnRunError("Lock path is not a regular file: %s" % path)
+        if st.st_uid != os.geteuid():
+            raise VpnRunError("Lock file %s is not owned by UID %d." % (path, os.geteuid()))
+        if stat.S_IMODE(st.st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def try_flock(fd: int, operation: int) -> bool:
+    try:
+        fcntl.flock(fd, operation | fcntl.LOCK_NB)
+        return True
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EAGAIN):
+            return False
+        raise VpnRunError("flock failed: %s" % exc)
+
+
+def acquire_lock(path: str, operation: int, timeout: int, what: str) -> int:
+    deadline = time.monotonic() + timeout
+    last_error: Optional[Exception] = None
+    while True:
+        fd = open_lock_file(path)
+        try:
+            if try_flock(fd, operation):
+                return fd
+        except Exception as exc:
+            last_error = exc
+            os.close(fd)
+            raise
+        os.close(fd)
+        if time.monotonic() >= deadline:
+            detail = ": %s" % last_error if last_error else ""
+            raise VpnRunError("Timed out waiting for %s lock (%s)%s" % (what, path, detail))
+        time.sleep(0.05)
+
+
+def acquire_ref_shared(layout: Layout, timeout: int) -> int:
+    return acquire_lock(layout.ref_lock, fcntl.LOCK_SH, timeout, "reference")
+
+
+def acquire_lifecycle(layout: Layout, timeout: int = 30) -> int:
+    return acquire_lock(layout.lifecycle_lock, fcntl.LOCK_EX, timeout, "lifecycle")
+
+
+def try_exclusive_ref(layout: Layout) -> Optional[int]:
+    fd = open_lock_file(layout.ref_lock)
+    if try_flock(fd, fcntl.LOCK_EX):
+        return fd
+    os.close(fd)
+    return None
+
+
+def lock_is_held(path: str) -> bool:
+    fd = open_lock_file(path)
+    if try_flock(fd, fcntl.LOCK_EX):
+        os.close(fd)
+        return False
+    os.close(fd)
+    return True
+
+
+def find_flock_holder(path: str) -> Optional[int]:
+    """Find the first local PID holding a flock on *path*.
+
+    ``/proc/locks`` represents each flock holder on a separate line.  The
+    lock owner is the fifth field for normal entries; continuation lines
+    (shared holders after the first) contain the owner as well.  This helper
+    is only used for diagnostics and for stopping a supervisor whose pid file
+    was lost, so a conservative return value is fine.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    major = os.major(st.st_dev)
+    minor = os.minor(st.st_dev)
+    inode = st.st_ino
+    try:
+        with open("/proc/locks", "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                parts = line.split()
+                if "FLOCK" not in parts:
+                    continue
+                idx = parts.index("FLOCK")
+                if idx + 5 >= len(parts):
+                    continue
+                devino = parts[idx + 4]
+                try:
+                    dev_major, dev_minor, dev_inode = devino.split(":")
+                    if (
+                        int(dev_major, 16) == major
+                        and int(dev_minor, 16) == minor
+                        and int(dev_inode, 10) == inode
+                    ):
+                        pid = int(parts[idx + 3])
+                        if pid > 0:
+                            return pid
+                except (ValueError, IndexError):
+                    continue
+    except OSError:
+        return None
+    return None
+
+
+def count_ref_holders(layout: Layout) -> Optional[int]:
+    """Count shared kernel flock holders for the reference lock.
+
+    This is an exact view of the kernel state and includes launchers that have
+    acquired a reference but have not yet written a registry entry.
+    """
+    try:
+        st = os.stat(layout.ref_lock)
+    except OSError:
+        return 0
+    major = os.major(st.st_dev)
+    minor = os.minor(st.st_dev)
+    inode = st.st_ino
+    count = 0
+    try:
+        with open("/proc/locks", "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                parts = line.split()
+                if "FLOCK" not in parts:
+                    continue
+                idx = parts.index("FLOCK")
+                # normal: id FLOCK ADVISORY READ pid dev:inode start end
+                # cont:   id -> FLOCK ADVISORY READ pid dev:inode start end
+                if idx + 4 >= len(parts):
+                    continue
+                if parts[idx + 2] != "READ":
+                    continue
+                devino = parts[idx + 4]
+                try:
+                    dev_major, dev_minor, dev_inode = devino.split(":")
+                    if (
+                        int(dev_major, 16) == major
+                        and int(dev_minor, 16) == minor
+                        and int(dev_inode, 10) == inode
+                    ):
+                        count += 1
+                except (ValueError, IndexError):
+                    continue
+        return count
+    except OSError:
+        return None
+
+
+def atomic_write_json(path: str, data: Dict[str, Any]) -> None:
+    directory = os.path.dirname(path)
+    tmp = os.path.join(directory, ".%s.%d.%s.tmp" % (os.path.basename(path), os.getpid(), secrets.token_hex(6)))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, sort_keys=True, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def read_json(path: str) -> Optional[Dict[str, Any]]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_size > 1024 * 1024:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            fd = -1
+            value = json.load(fh)
+        if not isinstance(value, dict):
+            return None
+        return value
+    except (OSError, ValueError):
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def state_load(layout: Layout) -> Dict[str, Any]:
+    value = read_json(layout.state_file)
+    return value if value else {}
+
+
+def state_update(layout: Layout, **changes: Any) -> Dict[str, Any]:
+    data = state_load(layout)
+    data.update(changes)
+    data["version"] = 1
+    data["vpn"] = layout.vpn
+    data["namespace"] = namespace_name(layout.vpn)
+    atomic_write_json(layout.state_file, data)
+    return data
+
+
+def state_grace(layout: Layout, default: int) -> int:
+    value = state_load(layout).get("grace", default)
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    if number < 0 or number > MAX_GRACE:
+        return default
+    return number
+
+
+def remove_state_dir(layout: Layout) -> None:
+    try:
+        shutil.rmtree(layout.state_dir)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise VpnRunError("Cannot remove runtime state %s: %s" % (layout.state_dir, exc))
+
+
+def register_ref(layout: Layout, command: Sequence[str], extra: Optional[Dict[str, Any]] = None) -> str:
+    _secure_dir(layout.state_dir)
+    _secure_dir(layout.refs_dir)
+    pid = os.getpid()
+    start = proc_start_time(pid) or 0
+    token = secrets.token_hex(6)
+    path = os.path.join(layout.refs_dir, "%d-%d-%s.json" % (pid, start, token))
+    record: Dict[str, Any] = {
+        "pid": pid,
+        "start_time": start,
+        "boot_id": read_boot_id(),
+        "vpn": layout.vpn,
+        "started_at": time.time(),
+        "command": list(command),
+    }
+    if extra:
+        record.update(extra)
+    atomic_write_json(path, record)
+    return path
+
+
+def unregister_ref(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log_warn("Could not remove reference record %s: %s" % (path, exc))
+
+
+def live_ref_records(layout: Layout) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    try:
+        names = sorted(os.listdir(layout.refs_dir))
+    except OSError:
+        return records
+    boot = read_boot_id()
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        record = read_json(os.path.join(layout.refs_dir, name))
+        if not record:
+            continue
+        pid = record.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            continue
+        if record.get("boot_id") not in (None, boot):
+            continue
+        expected = record.get("start_time")
+        actual = proc_start_time(pid)
+        if expected and actual != expected:
+            continue
+        if not pid_alive(pid):
+            continue
+        records.append(record)
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Supervisor log and pid file
+# ---------------------------------------------------------------------------
+
+def rotate_log(path: str) -> None:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise VpnRunError("Refusing unsafe log path: %s" % path)
+    if st.st_size <= LOG_MAX_BYTES:
+        return
+    try:
+        os.replace(path, path + ".1")
+    except OSError:
+        pass
+
+
+def open_append_secure(path: str) -> int:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise VpnRunError("Cannot open log %s: %s" % (path, exc))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            raise VpnRunError("Log file is not a regular user-owned file: %s" % path)
+        os.fchmod(fd, 0o600)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_log_tail(path: str, lines: int = 20) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 64 * 1024))
+            data = fh.read()
+    except OSError:
+        return ""
+    return "\n".join(data.splitlines()[-lines:])
+
+
+def write_supervisor_pid(layout: Layout) -> None:
+    pid = os.getpid()
+    atomic_write_json(
+        layout.pid_file,
+        {
+            "pid": pid,
+            "start_time": proc_start_time(pid) or 0,
+            "boot_id": read_boot_id(),
+            "vpn": layout.vpn,
+        },
+    )
+
+
+def remove_supervisor_pid(layout: Layout) -> None:
+    record = read_json(layout.pid_file)
+    if not record or record.get("pid") != os.getpid():
+        return
+    try:
+        os.unlink(layout.pid_file)
+    except OSError:
+        pass
+
+
+def read_supervisor_pid(layout: Layout) -> Optional[int]:
+    record = read_json(layout.pid_file)
+    if not record:
+        return None
+    pid = record.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    if record.get("boot_id") not in (None, read_boot_id()):
+        return None
+    expected = record.get("start_time")
+    if expected and proc_start_time(pid) != expected:
+        return None
+    if not pid_alive(pid):
+        return None
+    if not looks_like_supervisor(pid, layout.vpn):
+        return None
+    return pid
+
+
+def supervisor_pid(layout: Layout) -> Optional[int]:
+    pid = read_supervisor_pid(layout)
+    if pid:
+        return pid
+    holder = find_flock_holder(layout.supervisor_lock)
+    if holder and looks_like_supervisor(holder, layout.vpn):
+        return holder
+    return None
+
+
+def stop_process(pid: int, name: str, grace_seconds: float = 3.0) -> bool:
+    if pid <= 0 or not pid_alive(pid):
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        log_warn("Not permitted to signal %s PID %d." % (name, pid))
+        return False
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    time.sleep(0.1)
+    return not pid_alive(pid)
+
+
+# ---------------------------------------------------------------------------
+# wgc / ip wrapper
+# ---------------------------------------------------------------------------
+
+class Toolchain:
+    def __init__(self, wgc: str, ip: str, sudo_prefix: Sequence[str], test_mode: bool):
+        self.wgc = wgc
+        self.ip = ip
+        self.sudo_prefix = list(sudo_prefix)
+        self.test_mode = test_mode
+
+    @classmethod
+    def discover(cls) -> "Toolchain":
+        test = is_test_mode()
+        if test:
+            wgc = os.environ.get("VPN_RUN_WGC")
+            ip = os.environ.get("VPN_RUN_IP")
+            if wgc:
+                _validate_tool_override("VPN_RUN_WGC", wgc)
+            if ip:
+                _validate_tool_override("VPN_RUN_IP", ip)
+            if not wgc:
+                wgc = _find_wgc()
+            if not ip:
+                ip = _find_ip()
+            return cls(wgc, ip, [], True)
+
+        wgc = _find_wgc()
+        ip = _find_ip()
+        if not os.access(wgc, os.X_OK):
+            raise VpnRunError("wgc is not executable: %s" % wgc)
+        if not os.access(ip, os.X_OK):
+            raise VpnRunError("ip is not executable: %s" % ip)
+        sudo_bin = _find_sudo()
+        return cls(wgc, ip, [sudo_bin, "-n"], False)
+
+    def wgc_cmd(self, args: Sequence[str]) -> List[str]:
+        return self.sudo_prefix + [self.wgc] + list(args)
+
+    def ip_cmd(self, args: Sequence[str]) -> List[str]:
+        return self.sudo_prefix + [self.ip] + list(args)
+
+
+def _validate_tool_override(name: str, value: str) -> None:
+    if not os.path.isabs(value):
+        raise VpnRunError("%s must be an absolute path in test mode." % name)
+    if not os.path.isfile(value) or not os.access(value, os.X_OK):
+        raise VpnRunError("%s is not an executable file: %s" % (name, value))
+
+
+def _find_wgc() -> str:
+    candidates = [WGC_DEFAULT]
+    found = shutil.which("wgc")
+    if found:
+        candidates.append(found)
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise VpnRunError(
+        "wgc not found. Run install.sh as root, or install "
+        "https://github.com/colemar/wgc manually."
+    )
+
+
+def _find_ip() -> str:
+    for candidate in IP_CANDIDATES:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    found = shutil.which("ip")
+    if found:
+        return found
+    raise VpnRunError("ip not found. Install iproute2/iproute.")
+
+
+def _find_sudo() -> str:
+    for candidate in SUDO_CANDIDATES:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    found = shutil.which("sudo")
+    if found:
+        return found
+    raise VpnRunError("sudo not found. Re-run install.sh to install dependencies.")
+
+
+def namespace_active(rt: Toolchain, vpn: str) -> Tuple[bool, str]:
+    ns = namespace_name(vpn)
+    rc, out, err = run_text(rt.ip_cmd(["netns", "list"]), timeout=10)
+    if rc != 0:
+        if sudo_failure(err):
+            raise VpnRunError(sudo_hint())
+        raise VpnRunError("Cannot list network namespaces: %s" % (err.strip() or "ip exited %d" % rc))
+    for line in out.splitlines():
+        fields = line.split()
+        if fields and fields[0] == ns:
+            return True, ""
+    return False, ""
+
+
+def namespace_pids(rt: Toolchain, vpn: str) -> Tuple[bool, List[int], str]:
+    """Return (active, pids, error).
+
+    ``ip netns pids`` returns success for an existing namespace, including an
+    empty one, and failure when it is absent.  On unexpected errors we perform
+    a second, independent check so a transient failure never destroys a live
+    tunnel.
+    """
+    ns = namespace_name(vpn)
+    rc, out, err = run_text(rt.ip_cmd(["netns", "pids", ns]), timeout=10)
+    if rc == 0:
+        pids: List[int] = []
+        for token in out.split():
+            try:
+                pid = int(token)
+            except ValueError:
+                continue
+            if pid > 0:
+                pids.append(pid)
+        return True, sorted(set(pids)), ""
+    active, list_err = namespace_active(rt, vpn)
+    if active:
+        return True, [], (err.strip() or "ip netns pids failed with exit %d" % rc)
+    if sudo_failure(err) or sudo_failure(list_err):
+        raise VpnRunError(sudo_hint())
+    if list_err:
+        return False, [], list_err
+    return False, [], ""
+
+
+def filter_wgc_bridge_pids(vpn: str, pids: Sequence[int]) -> List[int]:
+    """Ignore wgc's systemd/socket-proxyd bridge helpers.
+
+    Bridges live in the namespace (and are root-owned), but they are
+    infrastructure, not applications.  Their environment/cgroup identifies
+    them reliably; if neither marker is readable we conservatively keep the
+    PID so the supervisor never tears down a namespace it cannot understand.
+    """
+    kept: List[int] = []
+    cgroup_marker_a = "wgc.%s." % vpn
+    cgroup_marker_b = "wgc-%s-" % vpn
+    for pid in pids:
+        is_bridge = False
+        try:
+            with open("/proc/%d/environ" % pid, "rb") as fh:
+                if b"WGC_BRIDGE=" in fh.read(1024 * 1024):
+                    is_bridge = True
+        except OSError:
+            pass
+        if not is_bridge:
+            try:
+                with open("/proc/%d/cgroup" % pid, "r", encoding="utf-8", errors="replace") as fh:
+                    cgroup = fh.read()
+                if cgroup_marker_a in cgroup or cgroup_marker_b in cgroup:
+                    is_bridge = True
+            except OSError:
+                pass
+        if not is_bridge:
+            try:
+                with open("/proc/%d/comm" % pid, "r", encoding="utf-8", errors="replace") as fh:
+                    comm = fh.read().strip()
+                if comm in ("systemd-socket-proxyd", "socat"):
+                    is_bridge = True
+            except OSError:
+                pass
+        if not is_bridge:
+            kept.append(pid)
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# State helpers used by the launcher and status
+# ---------------------------------------------------------------------------
+
+def ensure_state(layout: Layout, grace: int, active: bool) -> Dict[str, Any]:
+    data = state_load(layout)
+    now = time.time()
+    if not data or not active:
+        data["started_at"] = now
+    data.setdefault("started_at", now)
+    data["last_launch"] = now
+    data["grace"] = grace
+    data["version"] = 1
+    data["vpn"] = layout.vpn
+    data["namespace"] = namespace_name(layout.vpn)
+    atomic_write_json(layout.state_file, data)
+    return data
+
+
+def update_supervisor_state(layout: Layout, pid: Optional[int]) -> None:
+    if not pid:
+        return
+    try:
+        data = state_load(layout)
+        if not data:
+            return
+        data["supervisor_pid"] = pid
+        atomic_write_json(layout.state_file, data)
+    except (VpnRunError, OSError):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Supervisor spawning
+# ---------------------------------------------------------------------------
+
+def ensure_supervisor(rt: Toolchain, layout: Layout, grace: int) -> Optional[int]:
+    """Ensure exactly one supervisor is alive for this VPN.
+
+    The caller should hold the life-cycle lock.  The supervisor lock itself is
+    the source of truth.  A short wait handles the tiny window in which a
+    previous supervisor has removed its pid file but has not yet released the
+    supervisor lock while exiting.
+    """
+    if lock_is_held(layout.supervisor_lock):
+        pid = read_supervisor_pid(layout)
+        if pid:
+            update_supervisor_state(layout, pid)
+            return pid
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            pid = read_supervisor_pid(layout)
+            if pid:
+                update_supervisor_state(layout, pid)
+                return pid
+            if not lock_is_held(layout.supervisor_lock):
+                break
+            time.sleep(0.05)
+        pid = read_supervisor_pid(layout)
+        if pid:
+            update_supervisor_state(layout, pid)
+            return pid
+        if lock_is_held(layout.supervisor_lock):
+            # A healthy supervisor is starting but has not written its pid yet.
+            return None
+
+    script = os.path.realpath(__file__)
+    if not os.path.isfile(script):
+        raise VpnRunError("Cannot locate vpn-run script for supervisor: %s" % script)
+    last_error = "supervisor did not start"
+    for _attempt in range(2):
+        try:
+            rotate_log(layout.log_file)
+        except VpnRunError as exc:
+            last_error = str(exc)
+            break
+        try:
+            log_fd = open_append_secure(layout.log_file)
+        except VpnRunError as exc:
+            last_error = str(exc)
+            break
+        cmd = [
+            sys.executable or shutil.which("python3") or "/usr/bin/python3",
+            script,
+            "--internal-supervisor",
+            layout.vpn,
+            str(grace),
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                start_new_session=True,
+                cwd="/",
+                env=dict(os.environ),
+            )
+        finally:
+            os.close(log_fd)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            pid = read_supervisor_pid(layout)
+            if pid:
+                update_supervisor_state(layout, pid)
+                return pid
+            if proc.poll() is not None:
+                break
+            # Never probe with an exclusive flock here: doing so could steal
+            # the lock from the freshly spawned supervisor (which uses
+            # LOCK_NB) and make it exit.  The pid file is written immediately
+            # after the supervisor has acquired its lock.
+            time.sleep(0.05)
+        if proc.poll() is None:
+            # Still starting; give it a little more time.  It may be importing
+            # or resolving its own runtime path.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                pid = read_supervisor_pid(layout)
+                if pid:
+                    update_supervisor_state(layout, pid)
+                    return pid
+                time.sleep(0.05)
+        if proc.poll() is None:
+            # Do not leave orphaned children behind.  A supervisor that cannot
+            # write its pid file within seven seconds is not healthy.
+            stop_process(proc.pid, "unresponsive supervisor", 1.0)
+        last_error = "supervisor exited during startup"
+        tail = read_log_tail(layout.log_file)
+        if tail:
+            last_error += "\n" + tail
+    raise VpnRunError("Could not start the auto-teardown supervisor: %s" % last_error)
+
+
+# ---------------------------------------------------------------------------
+# Teardown
+# ---------------------------------------------------------------------------
+
+def _down_or_kill(rt: Toolchain, vpn: str) -> Tuple[bool, str]:
+    """Force the tunnel down, with compatibility for upstream wgc.
+
+    Upstream wgc implements forced teardown as ``wgc kill <vpn>``; its
+    ``wgc down <vpn>`` refuses to run while processes exist.  We first try the
+    requested ``down <vpn> force`` form (older wrappers tolerate the extra
+    argument), then fall back to ``kill``.
+    """
+    rc, out, err = run_text(rt.wgc_cmd(["down", vpn, "force"]), timeout=60)
+    if rc == 0:
+        return True, ""
+    first = (err.strip() or out.strip() or "wgc down exited %d" % rc)
+    rc2, out2, err2 = run_text(rt.wgc_cmd(["kill", vpn]), timeout=60)
+    if rc2 == 0:
+        return True, first
+    second = (err2.strip() or out2.strip() or "wgc kill exited %d" % rc2)
+    return False, "%s; %s" % (first, second)
+
+
+def teardown_locked(rt: Toolchain, layout: Layout, vpn: str, grace: int) -> str:
+    """Run a serialized teardown attempt.
+
+    Returns ``"exit"`` when the supervisor should exit, ``"reset"`` when
+    activity was observed and the grace timer must restart, or
+    ``"retry"`` when a transient failure should be retried later.
+    """
+    try:
+        life_fd = acquire_lifecycle(layout, timeout=5)
+    except VpnRunError as exc:
+        log_debug("teardown skipped while lifecycle is busy: %s" % exc)
+        return "retry"
+    ref_fd: Optional[int] = None
+    try:
+        ref_fd = try_exclusive_ref(layout)
+        if ref_fd is None:
+            return "reset"
+        try:
+            active, raw_pids, err = namespace_pids(rt, vpn)
+        except VpnRunError as exc:
+            log_warn("Cannot inspect namespace during teardown: %s" % exc)
+            return "retry"
+        if err:
+            log_warn("Cannot inspect namespace PID set: %s" % err)
+            return "retry"
+        pids = filter_wgc_bridge_pids(vpn, raw_pids) if active else []
+        if pids:
+            log_info("Namespace still has %d live process(es); postponing teardown." % len(pids))
+            return "reset"
+        if not active:
+            remove_state_dir(layout)
+            log_info("VPN '%s' was already down; runtime state removed." % vpn)
+            return "exit"
+
+        log_info("Grace period expired; tearing down VPN '%s'." % vpn)
+        try:
+            _ok, detail = _down_or_kill(rt, vpn)
+        except VpnRunError as exc:
+            log_warn("Forced teardown failed: %s" % exc)
+            return "retry"
+        if detail:
+            log_warn("Forced teardown note: %s" % detail.replace("\n", " "))
+        try:
+            active2, raw2, err2 = namespace_pids(rt, vpn)
+        except VpnRunError as exc:
+            log_warn("Could not verify teardown for '%s': %s" % (vpn, exc))
+            return "retry"
+        pids2 = filter_wgc_bridge_pids(vpn, raw2) if active2 else []
+        if err2 or active2 or pids2:
+            if err2:
+                log_warn("Teardown verification failed: %s" % err2)
+            else:
+                log_warn("VPN '%s' is still active after teardown attempt." % vpn)
+            return "retry"
+        remove_state_dir(layout)
+        log_info("VPN '%s' is down; runtime state removed." % vpn)
+        return "exit"
+    finally:
+        if ref_fd is not None:
+            os.close(ref_fd)
+        os.close(life_fd)
+
+
+def emergency_teardown(rt: Toolchain, layout: Layout, vpn: str, grace: int) -> None:
+    """Best-effort immediate teardown after a failed launch (never raises)."""
+    try:
+        outcome = teardown_locked(rt, layout, vpn, grace)
+        log_debug("emergency teardown outcome: %s" % outcome)
+    except Exception as exc:  # noqa: BLE001 - cleanup must never mask the original error
+        log_warn("Emergency teardown failed: %s" % exc)
+
+
+# ---------------------------------------------------------------------------
+# Firefox isolation
+# ---------------------------------------------------------------------------
+
+FIREFOX_NAMES = {"firefox", "firefox-bin", "firefox-esr"}
+
+
+def firefox_profile_dir() -> str:
+    home = os.environ.get("HOME")
+    if not home or not os.path.isabs(home):
+        try:
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except KeyError:
+            home = "/tmp"
+    profile = os.path.join(home, ".local", "share", PROG, "firefox-profile")
+    try:
+        os.makedirs(profile, mode=0o700, exist_ok=True)
+        st = os.lstat(profile)
+        if stat.S_ISLNK(st.st_mode):
+            raise VpnRunError("Refusing symlinked Firefox profile directory: %s" % profile)
+        if not stat.S_ISDIR(st.st_mode):
+            raise VpnRunError("Firefox profile path is not a directory: %s" % profile)
+        if st.st_uid != os.geteuid():
+            raise VpnRunError("Firefox profile directory is not owned by you: %s" % profile)
+        os.chmod(profile, 0o700)
+    except OSError as exc:
+        raise VpnRunError("Cannot create Firefox profile directory %s: %s" % (profile, exc))
+    return profile
+
+
+def isolate_firefox(command: Sequence[str]) -> Tuple[List[str], Optional[str]]:
+    if not command:
+        return list(command), None
+    base = os.path.basename(command[0])
+    if base not in FIREFOX_NAMES:
+        return list(command), None
+    args = list(command)
+    tail = args[1:]
+    has_profile = any(arg == "--profile" or arg.startswith("--profile=") for arg in tail)
+    has_named_profile = any(
+        arg == "-P" or arg.startswith("-P") or arg == "--ProfileManager" for arg in tail
+    )
+    insert_at = 1
+    if "--no-remote" not in tail:
+        args.insert(insert_at, "--no-remote")
+        insert_at += 1
+    profile: Optional[str] = None
+    if not has_profile and not has_named_profile:
+        profile = firefox_profile_dir()
+        args.insert(insert_at, "--profile")
+        args.insert(insert_at + 1, profile)
+    return args, profile
+
+
+# ---------------------------------------------------------------------------
+# Launch path
+# ---------------------------------------------------------------------------
+
+def _app_wait(proc: subprocess.Popen) -> int:
+    """Wait for an app while forwarding targeted signals.
+
+    The child remains in the terminal's process group, so Ctrl+C reaches it
+    directly.  Signals sent specifically to the launcher (SIGTERM, SIGHUP,
+    SIGQUIT) are forwarded so the app and the namespace are not orphaned.
+    """
+    child = proc
+
+    def forward(signum: int, _frame: Any) -> None:
+        if child.poll() is None:
+            try:
+                os.kill(child.pid, signum)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+
+    old_handlers: Dict[int, Any] = {}
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        try:
+            old_handlers[signum] = signal.signal(signum, forward)
+        except (OSError, ValueError):
+            pass
+    try:
+        while True:
+            try:
+                rc = child.wait()
+                break
+            except KeyboardInterrupt:
+                # The terminal delivered SIGINT to both processes.  Also send
+                # it to a launcher-targeted SIGINT (kill -INT <launcher>).
+                if child.poll() is None:
+                    try:
+                        os.kill(child.pid, signal.SIGINT)
+                    except ProcessLookupError:
+                        pass
+                continue
+    finally:
+        for signum, handler in old_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError):
+                pass
+    if rc < 0:
+        return 128 + (-rc)
+    if rc > 255:
+        return 255
+    return rc
+
+
+def launch_app(rt: Toolchain, layout: Layout, vpn: str, command: Sequence[str], grace: int) -> int:
+    lock_timeout = lock_timeout_from_env()
+    ref_fd = acquire_ref_shared(layout, lock_timeout)
+    life_fd: Optional[int] = None
+    ref_path: Optional[str] = None
+    app_command = list(command)
+    namespace_started_here = False
+    nup_attempted = False
+    monitor_supervisor = False
+    try:
+        life_fd = acquire_lifecycle(layout)
+        active, ns_error = namespace_active(rt, vpn)
+        if ns_error:
+            raise VpnRunError(ns_error)
+        was_active = active
+        if not active:
+            log_info("Starting WireGuard namespace '%s' on demand..." % namespace_name(vpn))
+            nup_attempted = True
+            rc, out, err = run_text(rt.wgc_cmd(["nup", vpn]), timeout=120)
+            if rc != 0:
+                detail = err.strip() or out.strip()
+                if sudo_failure(detail):
+                    raise VpnRunError(sudo_hint())
+                raise VpnRunError(
+                    "wgc nup %s failed with exit %d%s"
+                    % (vpn, rc, ": " + detail if detail else "")
+                )
+            if (out or "").strip():
+                print(out.rstrip(), file=sys.stderr, flush=True)
+            namespace_started_here = True
+            active, ns_error = namespace_active(rt, vpn)
+            if not active:
+                raise VpnRunError(
+                    "wgc nup %s reported success, but namespace %s is not present."
+                    % (vpn, namespace_name(vpn))
+                )
+
+        ensure_state(layout, grace, active=was_active)
+        supervisor = ensure_supervisor(rt, layout, grace)
+        if supervisor:
+            log_debug("auto-teardown supervisor is PID %d" % supervisor)
+        app_command, firefox_profile = isolate_firefox(command)
+        if firefox_profile:
+            log_info("Firefox detected: using isolated profile %s" % firefox_profile)
+        extra = {"firefox_profile": firefox_profile} if firefox_profile else None
+        ref_path = register_ref(layout, app_command, extra)
+        monitor_supervisor = True
+    except BaseException:
+        if life_fd is not None:
+            os.close(life_fd)
+            life_fd = None
+        os.close(ref_fd)
+        ref_fd = -1
+        if nup_attempted or namespace_started_here:
+            emergency_teardown(rt, layout, vpn, grace)
+        raise
+    finally:
+        if life_fd is not None:
+            os.close(life_fd)
+
+    try:
+        display = shlex.join(app_command)
+        if len(display) > 240:
+            display = display[:237] + "..."
+        log_info("Launching %s in namespace %s" % (display, namespace_name(vpn)))
+        cmd = rt.wgc_cmd(["exec", vpn] + app_command)
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                close_fds=True,
+                env=dict(os.environ),
+            )
+        except FileNotFoundError:
+            raise VpnRunError("Cannot execute wgc: %s" % rt.wgc)
+        except OSError as exc:
+            raise VpnRunError("Cannot start application: %s" % exc)
+        rc = _app_wait(proc)
+        if rc == 0:
+            log_info("%s exited successfully." % os.path.basename(app_command[0]))
+        else:
+            log_warn("%s exited with status %d." % (os.path.basename(app_command[0]), rc))
+        return rc
+    finally:
+        if ref_path:
+            unregister_ref(ref_path)
+        if ref_fd >= 0:
+            os.close(ref_fd)
+        if monitor_supervisor:
+            # If a supervisor was killed or crashed while the app ran, start a
+            # fresh one now so the namespace is still closed automatically.
+            try:
+                life_fd = acquire_lifecycle(layout, timeout=5)
+                try:
+                    if namespace_active(rt, vpn)[0]:
+                        ensure_supervisor(rt, layout, grace)
+                finally:
+                    os.close(life_fd)
+            except VpnRunError as exc:
+                log_debug("post-exit supervisor check skipped: %s" % exc)
+
+
+# ---------------------------------------------------------------------------
+# Status and kill
+# ---------------------------------------------------------------------------
+
+def _print_ps(pids: Sequence[int]) -> None:
+    if not pids:
+        print("  (none)")
+        return
+    ps = shutil.which("ps") or "/usr/bin/ps"
+    try:
+        cp = subprocess.run(
+            [ps, "-o", "pid=,user=,stat=,etimes=,args=", "-p", ",".join(str(p) for p in pids)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        print("  " + " ".join(str(p) for p in pids))
+        return
+    output = (cp.stdout or "").strip()
+    if not output:
+        print("  " + " ".join(str(p) for p in pids))
+        return
+    for line in output.splitlines():
+        print("  " + line.strip())
+
+
+def cmd_status(rt: Toolchain, layout: Layout) -> int:
+    vpn = layout.vpn
+    state = state_load(layout)
+    active = False
+    pids: List[int] = []
+    error = ""
+    try:
+        active, pids, error = namespace_pids(rt, vpn)
+    except VpnRunError as exc:
+        error = str(exc)
+    refs = count_ref_holders(layout)
+    records = live_ref_records(layout)
+    if refs is None:
+        refs = len(records)
+        refs_label = "%d (registry fallback)" % refs
+    else:
+        refs_label = "%d" % refs
+    sup = supervisor_pid(layout)
+
+    print(color_stdout("%s %s" % (PROG, VERSION), "1;36"))
+    print("VPN profile:   %s" % vpn)
+    print("Namespace:     %s" % namespace_name(vpn))
+    if active:
+        print("State:         %s" % color_stdout("ACTIVE", "1;32"))
+    else:
+        print("State:         %s" % color_stdout("INACTIVE", "1;33"))
+    print("Reference locks: %s" % refs_label)
+    if state.get("started_at"):
+        try:
+            started = float(state["started_at"])
+            print("Up since:      %s (%s ago)" % (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
+                format_duration(time.time() - started),
+            ))
+        except (TypeError, ValueError):
+            pass
+    if sup:
+        print("Supervisor:    running (PID %d)" % sup)
+    else:
+        print("Supervisor:    not running")
+    print("Runtime:       %s" % layout.root)
+
+    if error:
+        log_warn(error)
+    if not active:
+        if state:
+            log_warn("Stale runtime state exists for '%s'; the next launch or --kill cleans it." % vpn)
+        if refs:
+            log_warn("Reference locks are still held even though the namespace is down.")
+        if sup:
+            log_warn("A supervisor is still running without an active namespace; it will exit.")
+        return 0
+
+    print("")
+    print(color_stdout("Mullvad / wgc connection details", "1;34"))
+    try:
+        rc, out, err = run_text(rt.wgc_cmd(["state", vpn]), timeout=20)
+        text = (out or "").strip()
+        if rc == 0 and text:
+            for line in text.splitlines():
+                print("  " + line)
+        else:
+            detail = (err or out).strip() or "wgc state exited %d" % rc
+            log_warn(detail)
+    except VpnRunError as exc:
+        log_warn(str(exc))
+
+    print("")
+    print(color_stdout("Processes in namespace %s" % namespace_name(vpn), "1;34"))
+    _print_ps(pids)
+
+    if records:
+        print("")
+        print(color_stdout("Client reference records", "1;34"))
+        print("  %-8s %-19s %s" % ("PID", "STARTED", "COMMAND"))
+        for record in sorted(records, key=lambda item: item.get("started_at", 0)):
+            pid = record.get("pid", "?")
+            started = record.get("started_at")
+            when = "unknown"
+            if isinstance(started, (int, float)):
+                when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started))
+            command = record.get("command") or []
+            name = os.path.basename(str(command[0])) if command else "?"
+            print("  %-8s %-19s %s" % (pid, when, name))
+    return 0
+
+
+def cmd_kill(rt: Toolchain, layout: Layout) -> int:
+    vpn = layout.vpn
+    try:
+        life_fd = acquire_lifecycle(layout, timeout=5)
+    except VpnRunError:
+        # A supervisor may be in the middle of a slow wgc down during the
+        # idle grace period.  Interrupt it, then take the life-cycle lock.
+        sup = supervisor_pid(layout)
+        if sup:
+            log_warn("Life-cycle lock busy; interrupting supervisor PID %d." % sup)
+            stop_process(sup, "supervisor", 3.0)
+        life_fd = acquire_lifecycle(layout, timeout=30)
+    try:
+        # Stop the supervisor first.  The life-cycle lock prevents it from
+        # entering a teardown section concurrently.
+        sup = supervisor_pid(layout)
+        if sup:
+            log_info("Stopping auto-teardown supervisor (PID %d)..." % sup)
+            if not stop_process(sup, "supervisor", 3.0):
+                log_warn("Supervisor PID %d did not exit." % sup)
+
+        active, pids, err = namespace_pids(rt, vpn)
+        if err:
+            log_warn("Namespace inspection warning: %s" % err)
+        if active:
+            log_info("Force-killing all processes in namespace %s..." % namespace_name(vpn))
+            rc, out, die_err = run_text(rt.wgc_cmd(["kill", vpn]), timeout=60)
+            if rc != 0:
+                detail = die_err.strip() or out.strip()
+                if sudo_failure(detail):
+                    raise VpnRunError(sudo_hint())
+                log_warn("wgc kill failed: %s" % (detail or "exit %d" % rc))
+                _down_or_kill(rt, vpn)
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                try:
+                    active, _pids, _err = namespace_pids(rt, vpn)
+                except VpnRunError:
+                    break
+                if not active:
+                    break
+                time.sleep(0.2)
+            if active:
+                raise VpnRunError(
+                    "VPN '%s' is still active after wgc kill. Inspect with "
+                    "'sudo wgc state %s' and 'sudo ip netns pids %s'."
+                    % (vpn, vpn, namespace_name(vpn))
+                )
+            log_info("VPN '%s' has been force-stopped." % vpn)
+        else:
+            log_info("VPN '%s' is already down." % vpn)
+
+        remove_state_dir(layout)
+        log_info("Runtime state for '%s' removed." % vpn)
+        return 0
+    finally:
+        os.close(life_fd)
+
+
+# ---------------------------------------------------------------------------
+# Internal supervisor
+# ---------------------------------------------------------------------------
+
+def _supervisor_log(message: str) -> None:
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    print("%s [%s] %s" % (stamp, PROG, message), file=sys.stderr, flush=True)
+
+
+def supervisor_run(vpn: str, initial_grace: int) -> int:
+    os.umask(0o077)
+    rt = Toolchain.discover()
+    layout = Layout(resolve_runtime_root(), vpn)
+    layout.ensure()
+    lock_fd = open_lock_file(layout.supervisor_lock)
+    if not try_flock(lock_fd, fcntl.LOCK_EX):
+        os.close(lock_fd)
+        return 0
+    stop = {"flag": False}
+
+    def handle_signal(signum: int, _frame: Any) -> None:
+        stop["flag"] = True
+        _supervisor_log("received signal %d; stopping." % signum)
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(signum, handle_signal)
+        except (OSError, ValueError):
+            pass
+
+    try:
+        write_supervisor_pid(layout)
+        _supervisor_log(
+            "started for VPN '%s' (namespace %s, grace %ds)"
+            % (vpn, namespace_name(vpn), initial_grace)
+        )
+        idle_since: Optional[float] = None
+        idle_logged = False
+        active_logged = False
+        while not stop["flag"]:
+            try:
+                ref_fd = try_exclusive_ref(layout)
+                refs_free = ref_fd is not None
+                if ref_fd is not None:
+                    os.close(ref_fd)
+
+                if not refs_free:
+                    if idle_since is not None:
+                        _supervisor_log("new activity detected; grace timer reset.")
+                    idle_since = None
+                    idle_logged = False
+                    if not active_logged:
+                        _supervisor_log("namespace active (references held).")
+                        active_logged = True
+                else:
+                    active, raw_pids, ns_error = namespace_pids(rt, vpn)
+                    if ns_error:
+                        raise VpnRunError(ns_error)
+                    pids = filter_wgc_bridge_pids(vpn, raw_pids) if active else []
+                    if not pids:
+                        if idle_since is None:
+                            idle_since = time.monotonic()
+                            if not idle_logged:
+                                _supervisor_log(
+                                    "no references and no processes; waiting grace period."
+                                )
+                                idle_logged = True
+                        active_logged = False
+                        grace = state_grace(layout, initial_grace)
+                        if time.monotonic() - idle_since >= grace:
+                            outcome = teardown_locked(rt, layout, vpn, grace)
+                            if outcome == "exit":
+                                break
+                            if outcome == "reset":
+                                idle_since = None
+                                idle_logged = False
+                            else:
+                                # Transient failure: wait another grace period.
+                                idle_since = time.monotonic()
+                                idle_logged = True
+                    else:
+                        if idle_since is not None:
+                            _supervisor_log("new activity detected; grace timer reset.")
+                        idle_since = None
+                        idle_logged = False
+                        if not active_logged:
+                            _supervisor_log(
+                                "namespace active (pids=%d, no references)." % len(pids)
+                            )
+                            active_logged = True
+            except VpnRunError as exc:
+                _supervisor_log("watch error: %s" % exc)
+                if idle_since is not None:
+                    idle_since = time.monotonic()
+            except Exception as exc:  # noqa: BLE001 - supervisor must stay alive
+                _supervisor_log("unexpected watch error: %s" % exc)
+                if idle_since is not None:
+                    idle_since = time.monotonic()
+            if stop["flag"]:
+                break
+            time.sleep(POLL_INTERVAL)
+        _supervisor_log("exiting.")
+        return 0
+    finally:
+        remove_supervisor_pid(layout)
+        os.close(lock_fd)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+class Options:
+    def __init__(self) -> None:
+        self.vpn = DEFAULT_VPN
+        self.grace = DEFAULT_GRACE
+        self.action = "run"
+        self.command: List[str] = []
+        self.show_help = False
+        self.show_version = False
+
+
+def parse_args(argv: Sequence[str]) -> Options:
+    options = Options()
+    options.vpn = default_vpn_from_env()
+    options.grace = grace_from_env()
+    i = 0
+    leftovers: List[str] = []
+    while i < len(argv):
+        arg = argv[i]
+        if options.command:
+            options.command.append(arg)
+            i += 1
+            continue
+        if arg == "--":
+            leftovers = list(argv[i + 1:])
+            break
+        if arg in ("-h", "--help"):
+            options.show_help = True
+            return options
+        if arg in ("-V", "--version"):
+            options.show_version = True
+            return options
+        if arg in ("-s", "--status"):
+            if options.action not in ("run", "status"):
+                raise UsageError("--status and --kill are mutually exclusive.")
+            options.action = "status"
+            i += 1
+            continue
+        if arg in ("-k", "--kill"):
+            if options.action not in ("run", "kill"):
+                raise UsageError("--status and --kill are mutually exclusive.")
+            options.action = "kill"
+            i += 1
+            continue
+        if arg in ("-v", "--vpn"):
+            if i + 1 >= len(argv):
+                raise UsageError("%s requires a VPN name." % arg)
+            options.vpn = validate_vpn_name(argv[i + 1])
+            i += 2
+            continue
+        if arg.startswith("--vpn="):
+            options.vpn = validate_vpn_name(arg.split("=", 1)[1])
+            i += 1
+            continue
+        if arg.startswith("-v") and arg != "-v":
+            options.vpn = validate_vpn_name(arg[2:])
+            i += 1
+            continue
+        if arg in ("-g", "--grace"):
+            if i + 1 >= len(argv):
+                raise UsageError("%s requires a number of seconds." % arg)
+            options.grace = parse_bounded_int(argv[i + 1], "grace period", 0, MAX_GRACE)
+            i += 2
+            continue
+        if arg.startswith("--grace="):
+            options.grace = parse_bounded_int(arg.split("=", 1)[1], "grace period", 0, MAX_GRACE)
+            i += 1
+            continue
+        if arg.startswith("-g") and arg != "-g":
+            options.grace = parse_bounded_int(arg[2:], "grace period", 0, MAX_GRACE)
+            i += 1
+            continue
+        if arg == "--debug":
+            os.environ["VPN_RUN_DEBUG"] = "1"
+            i += 1
+            continue
+        if arg.startswith("-"):
+            raise UsageError("Unknown option: %s" % arg)
+        leftovers = list(argv[i:])
+        break
+    if options.action == "run":
+        options.command = leftovers
+    else:
+        if leftovers:
+            raise UsageError("--status/--kill cannot be combined with a command.")
+        options.command = []
+    return options
+
+
+def print_help() -> None:
+    with_color = _stream_colors(sys.stdout)
+
+    def bold(text: str) -> str:
+        return _paint(text, "1", with_color)
+
+    def cyan(text: str) -> str:
+        return _paint(text, "1;36", with_color)
+
+    def green(text: str) -> str:
+        return _paint(text, "1;32", with_color)
+
+    def yellow(text: str) -> str:
+        return _paint(text, "1;33", with_color)
+
+    def dim(text: str) -> str:
+        return _paint(text, "0;2", with_color)
+
+    print("%s %s" % (cyan(PROG), dim("v" + VERSION)))
+    print("On-demand, reference-counted, auto-closing WireGuard namespace launcher.")
+    print("")
+    print(bold("Usage:"))
+    print("  %s [OPTIONS] <COMMAND> [ARGS...]" % green(PROG))
+    print("  %s --status [-v NAME]" % green(PROG))
+    print("  %s --kill [-v NAME]" % green(PROG))
+    print("")
+    print(bold("Options:"))
+    print("  -v, --vpn NAME        WireGuard config name (default: %s)" % DEFAULT_VPN)
+    print("  -g, --grace SECONDS   Idle grace period before teardown (default: %d)" % DEFAULT_GRACE)
+    print("  -s, --status          Show namespace, connection and PID details")
+    print("  -k, --kill            Force-kill every process and destroy the tunnel")
+    print("  -h, --help            Show this help")
+    print("  -V, --version         Show version")
+    print("      --debug           Verbose launcher diagnostics on stderr")
+    print("")
+    print(bold("Examples:"))
+    print("  %s qbittorrent" % green(PROG))
+    print("  %s firefox" % green(PROG))
+    print("  %s curl https://am.i.mullvad.net/connected" % green(PROG))
+    print("  %s -v work firefox" % green(PROG))
+    print("  %s --status" % green(PROG))
+    print("  %s --kill" % green(PROG))
+    print("")
+    print(bold("How it works:"))
+    print("  1. The first invocation starts '%s' with wgc nup." % namespace_name(DEFAULT_VPN))
+    print("  2. Every app holds a kernel flock reference on the shared namespace.")
+    print("  3. A detached supervisor waits for zero references and zero namespace")
+    print("     processes, then tears the tunnel down after the grace period.")
+    print("  4. If an app segfaults or is killed -9, namespace PID monitoring keeps")
+    print("     the tunnel alive until its children also exit.")
+    print("")
+    print(bold("Environment:"))
+    print("  XDG_RUNTIME_DIR             Secure per-user runtime directory")
+    print("  VPN_RUN_DEFAULT_VPN         Default VPN profile (default: mullvad)")
+    print("  VPN_RUN_GRACE_PERIOD        Default grace period in seconds")
+    print("  VPN_RUN_LOCK_TIMEOUT        Reference lock timeout (default: 60)")
+    print("  NO_COLOR                    Disable ANSI colors in output")
+    print("")
+    print(yellow("Requires passwordless sudo for /usr/local/bin/wgc and ip."))
+    print(dim("Install with ./install.sh; see README.md for Mullvad setup."))
+
+
+def print_version() -> None:
+    print("%s %s" % (PROG, VERSION))
+
+
+def main(argv: Sequence[str]) -> int:
+    try:
+        options = parse_args(argv)
+    except UsageError as exc:
+        log_error(str(exc))
+        print("Try '%s --help'." % PROG, file=sys.stderr)
+        return 2
+
+    if options.show_help:
+        print_help()
+        return 0
+    if options.show_version:
+        print_version()
+        return 0
+
+    if options.action == "run" and not options.command:
+        log_error("No command specified.")
+        print("Try '%s --help'." % PROG, file=sys.stderr)
+        return 2
+
+    try:
+        ensure_unprivileged()
+        sync_environment_and_reexec(argv)
+        validate_vpn_name(options.vpn)
+        rt = Toolchain.discover()
+        runtime_root = resolve_runtime_root()
+        layout = Layout(runtime_root, options.vpn)
+        layout.ensure()
+        if options.action == "status":
+            return cmd_status(rt, layout)
+        if options.action == "kill":
+            return cmd_kill(rt, layout)
+        return launch_app(rt, layout, options.vpn, options.command, options.grace)
+    except KeyboardInterrupt:
+        log_warn("Interrupted.")
+        return 130
+    except VpnRunError as exc:
+        log_error(str(exc))
+        return 1
+    except PermissionError as exc:
+        log_error("Permission denied: %s" % exc)
+        return 1
+    except OSError as exc:
+        log_error("Operating system error: %s" % exc)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - top-level safety net
+        log_error("Unexpected failure: %s" % exc)
+        if os.environ.get("VPN_RUN_DEBUG") == "1":
+            raise
+        return 1
+
+
+def _internal_supervisor(argv: Sequence[str]) -> int:
+    if len(argv) < 2:
+        return 2
+    try:
+        vpn = validate_vpn_name(argv[0])
+        initial_grace = parse_bounded_int(argv[1], "initial grace", 0, MAX_GRACE)
+    except UsageError:
+        return 2
+    try:
+        return supervisor_run(vpn, initial_grace)
+    except KeyboardInterrupt:
+        return 130
+    except VpnRunError as exc:
+        _supervisor_log("fatal: %s" % exc)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - daemon must log and exit cleanly
+        _supervisor_log("fatal unexpected error: %s" % exc)
+        return 1
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--internal-supervisor":
+        sys.exit(_internal_supervisor(sys.argv[2:]))
+    sys.exit(main(sys.argv[1:]))
