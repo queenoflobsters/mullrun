@@ -1,20 +1,20 @@
-# mullrun — `vpn-run`
+# mullrun
 
-`vpn-run` is an on-demand, reference-counted, auto-closing launcher for
+`mullrun` is an on-demand, reference-counted, auto-closing launcher for
 applications that must use a Mullvad WireGuard tunnel. It wraps
 [`wgc`](https://github.com/colemar/wgc), which builds a dedicated Linux network
 namespace for each WireGuard profile. The application never sees the host's
 physical network interfaces; if the tunnel disappears, the namespace and the
 application's network path disappear with it.
 
-The repository is named **mullrun**; the installed command is **`vpn-run`**.
+The repository is named **mullrun**; the installed command is **`mullrun`**.
 
 ```
-$ vpn-run qbittorrent
-$ vpn-run firefox
-$ vpn-run curl https://am.i.mullvad.net/connected
-$ vpn-run --status
-$ vpn-run --kill
+$ mullrun qbittorrent
+$ mullrun firefox
+$ mullrun curl https://am.i.mullvad.net/connected
+$ mullrun --status
+$ mullrun --kill
 ```
 
 ## Contents
@@ -39,11 +39,11 @@ $ vpn-run --kill
 ```
                        desktop session (UID 1000)
  ┌──────────────────────────────────────────────────────────────────────┐
- │  shell:  vpn-run firefox                                             │
+ │  shell:  mullrun firefox                                             │
  │            │                                                         │
  │            ▼                                                         │
  │  ┌─────────────────────┐    shared flock     ┌────────────────────┐   │
- │  │ vpn-run launcher    │────────────────────▶│ <vpn>.ref.lock     │   │
+ │  │ mullrun launcher    │────────────────────▶│ <vpn>.ref.lock     │   │
  │  │ (one per app)       │                     └────────────────────┘   │
  │  │  - holds ref lock   │                              ▲               │
  │  │  - registers PID    │                              │ exclusive     │
@@ -101,9 +101,9 @@ hard IPv6 guarantee, either:
 - confirm that the profile has no IPv6 address/route and that `ip -6 route`
   inside the namespace is empty; or
 - disable IPv6 for the Mullvad device in the Mullvad account settings, or
-  explicitly test with `vpn-run curl -6 ...` and verify failure.
+  explicitly test with `mullrun curl -6 ...` and verify failure.
 
-Use `vpn-run sh -c 'ip -brief address; ip route; ip -6 route'` to inspect what
+Use `mullrun sh -c 'ip -brief address; ip route; ip -6 route'` to inspect what
 the application can actually see.
 
 ## Concurrency and crash-proof cleanup
@@ -184,10 +184,10 @@ What each scenario does:
 
 Firefox normally talks to an existing host instance over a Unix socket and can
 silently open a tab in a non-VPN browser. When the target command is
-`firefox`, `firefox-bin`, or `firefox-esr`, `vpn-run`:
+`firefox`, `firefox-bin`, or `firefox-esr`, `mullrun`:
 
 - adds `--no-remote` (unless already supplied); and
-- adds `--profile ~/.local/share/vpn-run/firefox-profile` (unless the caller
+- adds `--profile ~/.local/share/mullrun/firefox-profile` (unless the caller
   supplied `--profile` or `-P`).
 
 The directory is created with mode `0700`. The VPN Firefox instance therefore
@@ -206,10 +206,10 @@ environment from the process that invoked sudo, then drops privileges with
 - PipeWire/PulseAudio environment and the per-user audio sockets
 - `HOME`, `USER`, `LOGNAME`, locale and `PATH`
 
-`vpn-run` applies missing session defaults and does one `execve` after a
+`mullrun` applies missing session defaults and does one `execve` after a
 possible root-to-user drop so the final environment is visible in
 `/proc/PID/environ`, which is what `wgc exec` reads. The target app runs as the
-invoking user, never as root. Running `sudo vpn-run` is explicitly refused
+invoking user, never as root. Running `sudo mullrun` is explicitly refused
 unless the original sudo user can be recovered and privileges can be dropped.
 
 > The process is a Python script, not a setuid binary. Do not add a setuid bit;
@@ -241,8 +241,8 @@ socat procps-ng
 ```
 
 It then installs `wgc` from the official upstream URL, installs
-`/usr/local/bin/vpn-run`, creates `/etc/wireguard/wgc_enable`, and writes
-`/etc/sudoers.d/vpn-run-nopasswd` after validating it with `visudo -cf`.
+`/usr/local/bin/mullrun`, creates `/etc/wireguard/wgc_enable`, and writes
+`/etc/sudoers.d/mullrun-nopasswd` after validating it with `visudo -cf`.
 
 Your user must be in the `wheel` group:
 
@@ -272,7 +272,7 @@ run `sudo pacman -Syu` and re-run the installer.
 
 ### What the sudoers policy allows
 
-`/etc/sudoers.d/vpn-run-nopasswd` contains passwordless entries for the
+`/etc/sudoers.d/mullrun-nopasswd` contains passwordless entries for the
 `wheel` group only, restricted to:
 
 - `/usr/local/bin/wgc`
@@ -285,8 +285,8 @@ leaves the old configuration untouched.
 ### Manual inspection after installation
 
 ```bash
-command -v vpn-run wgc ip
-sudo visudo -cf /etc/sudoers.d/vpn-run-nopasswd
+command -v mullrun wgc ip
+sudo visudo -cf /etc/sudoers.d/mullrun-nopasswd
 sudo /usr/local/bin/wgc req
 ls -ld /etc/wireguard
 ```
@@ -315,7 +315,7 @@ ls -ld /etc/wireguard
 7. Start a test through the namespace:
 
    ```bash
-   vpn-run curl https://am.i.mullvad.net/connected
+   mullrun curl https://am.i.mullvad.net/connected
    ```
 
    A connected response looks like:
@@ -338,7 +338,7 @@ Additional profiles are supported by naming the config
 
 ```bash
 sudo install -m 600 ~/Downloads/office.conf /etc/wireguard/office.conf
-vpn-run -v office curl https://am.i.mullvad.net/connected
+mullrun -v office curl https://am.i.mullvad.net/connected
 ```
 
 `wgc` requires `/etc/wireguard` to be root-owned and not writable by group or
@@ -353,9 +353,9 @@ run `sudo chmod go-w /etc/wireguard`.
 
 ```text
 Usage:
-  vpn-run [OPTIONS] <COMMAND> [ARGS...]
-  vpn-run --status [-v NAME]
-  vpn-run --kill [-v NAME]
+  mullrun [OPTIONS] <COMMAND> [ARGS...]
+  mullrun --status [-v NAME]
+  mullrun --kill [-v NAME]
 ```
 
 | Option | Description |
@@ -372,8 +372,8 @@ Usage:
 ### GUI applications
 
 ```bash
-vpn-run qbittorrent
-vpn-run firefox
+mullrun qbittorrent
+mullrun firefox
 ```
 
 Firefox receives an isolated profile automatically. For a different profile
@@ -382,22 +382,22 @@ name, supply `--profile` yourself; `--no-remote` is still added.
 ### CLI tools
 
 ```bash
-vpn-run curl ifconfig.me
-vpn-run curl https://am.i.mullvad.net/connected
-vpn-run sh -c 'ip -brief address; ip route; getent hosts example.com'
+mullrun curl ifconfig.me
+mullrun curl https://am.i.mullvad.net/connected
+mullrun sh -c 'ip -brief address; ip route; getent hosts example.com'
 ```
 
 ### Alternative profile
 
 ```bash
-vpn-run -v office firefox
-vpn-run --vpn=office --status
+mullrun -v office firefox
+mullrun --vpn=office --status
 ```
 
 ### Status
 
 ```bash
-vpn-run --status
+mullrun --status
 ```
 
 Shows:
@@ -415,8 +415,8 @@ start or stop anything.
 ### Kill / manual recovery
 
 ```bash
-vpn-run --kill
-vpn-run --kill -v office
+mullrun --kill
+mullrun --kill -v office
 ```
 
 `--kill` stops the supervisor, calls `wgc kill` (which terminates every
@@ -430,8 +430,8 @@ The grace period prevents rapid tunnel flapping when you close one app and
 start another immediately.
 
 ```bash
-vpn-run --grace 15 qbittorrent
-VPN_RUN_GRACE_PERIOD=10 vpn-run firefox
+mullrun --grace 15 qbittorrent
+VPN_RUN_GRACE_PERIOD=10 mullrun firefox
 ```
 
 The supervisor reads the latest grace value from the runtime state file; a new
@@ -444,10 +444,10 @@ The application is already inside a namespace with only the WireGuard
 interface. As a **secondary defense**, bind qBittorrent explicitly to that
 interface:
 
-1. Start it with `vpn-run qbittorrent`.
+1. Start it with `mullrun qbittorrent`.
 2. Open **Tools → Options → Advanced**.
 3. Set **Network Interface** to `wgc_mullvad` (or `wgc_<your-profile>`).
-4. Apply and restart qBittorrent inside `vpn-run`.
+4. Apply and restart qBittorrent inside `mullrun`.
 
 Inside the namespace, qBittorrent only sees `lo` and `wgc_<profile>`. Binding to
 the WireGuard interface means that even a future routing change cannot make it
@@ -466,11 +466,11 @@ feature; do not add a host-side route into the namespace.
 
 ## Runtime layout and configuration
 
-Per-user runtime state lives under `$XDG_RUNTIME_DIR/vpn-run` (normally
-`/run/user/<uid>/vpn-run`, mode `0700`):
+Per-user runtime state lives under `$XDG_RUNTIME_DIR/mullrun` (normally
+`/run/user/<uid>/mullrun`, mode `0700`):
 
 ```text
-/run/user/<uid>/vpn-run/
+/run/user/<uid>/mullrun/
 ├── locks/
 │   ├── <profile>.ref.lock
 │   ├── <profile>.lifecycle.lock
@@ -544,12 +544,12 @@ It checks:
 Run individual static checks manually:
 
 ```bash
-python3 -m py_compile bin/vpn-run
+python3 -m py_compile bin/mullrun
 shellcheck install.sh uninstall.sh tests/test_lifecycle.sh
-flake8 --max-line-length=120 bin/vpn-run
+flake8 --max-line-length=120 bin/mullrun
 ```
 
-`ruff check --select E,F --line-length 120 bin/vpn-run` is an equivalent
+`ruff check --select E,F --line-length 120 bin/mullrun` is an equivalent
 modern alternative when flake8 is unavailable.
 
 ## Troubleshooting
@@ -560,7 +560,7 @@ The sudoers drop-in is missing, invalid, or your user is not in `wheel`.
 
 ```bash
 id -nG
-sudo visudo -cf /etc/sudoers.d/vpn-run-nopasswd
+sudo visudo -cf /etc/sudoers.d/mullrun-nopasswd
 sudo visudo -c
 ```
 
@@ -584,7 +584,7 @@ official script over HTTPS, verifies that it is a plausible Bash script with
 
 On Arch Linux, `wgc req` may warn that `resolvconf` is unavailable. The
 namespace mode (`nup`) writes `/etc/netns/<namespace>/resolv.conf` directly and
-does not need `resolvconf`; the warning is not fatal for `vpn-run`.
+does not need `resolvconf`; the warning is not fatal for `mullrun`.
 
 ### `wgc_enable` / insecure config directory
 
@@ -606,14 +606,14 @@ removes it when it carries the installer's marker.
 Inspect the supervisor log and namespace:
 
 ```bash
-tail -n 100 /run/user/$(id -u)/vpn-run/logs/mullvad.log
-vpn-run --status
+tail -n 100 /run/user/$(id -u)/mullrun/logs/mullvad.log
+mullrun --status
 sudo ip netns pids wgc_mullvad
 sudo wgc state mullvad
 ```
 
 If a daemonized child remains in the namespace, the supervisor intentionally
-keeps the namespace alive. Use `vpn-run --kill` to force it down. If the
+keeps the namespace alive. Use `mullrun --kill` to force it down. If the
 supervisor is missing, the next launch or the launcher's post-exit check starts
 a new one.
 
@@ -637,7 +637,7 @@ Diagnosis:
 
 ```bash
 # Does the app use the resolved socket?
-vpn-run sh -c 'strace -f -e trace=connect getent hosts example.com' 2>&1 | grep -E 'resolve|53'
+mullrun sh -c 'strace -f -e trace=connect getent hosts example.com' 2>&1 | grep -E 'resolve|53'
 
 # What is nsswitch actually doing?
 grep '^hosts:' /etc/nsswitch.conf
@@ -655,7 +655,7 @@ Mitigations, in increasing order of strength:
    # Create a resolver config without nss-resolve
    sed 's/\bresolve\b//g' /etc/nsswitch.conf > /tmp/nsswitch.vpn
 
-   vpn-run bwrap --dev-bind / / \
+   mullrun bwrap --dev-bind / / \
        --bind /tmp/nsswitch.vpn /etc/nsswitch.conf \
        --tmpfs /run/systemd/resolve \
        --tmpfs /run/nscd \
@@ -715,18 +715,18 @@ another process is holding an exclusive lock or a supervisor is in a slow
 teardown. Inspect:
 
 ```bash
-vpn-run --status
-fuser -v /run/user/$(id -u)/vpn-run/locks/mullvad.ref.lock
-cat /run/user/$(id -u)/vpn-run/logs/mullvad.log
+mullrun --status
+fuser -v /run/user/$(id -u)/mullrun/locks/mullvad.ref.lock
+cat /run/user/$(id -u)/mullrun/logs/mullvad.log
 ```
 
 Increase `VPN_RUN_LOCK_TIMEOUT` only if `wgc down` is legitimately slow. If a
-process is wedged, `vpn-run --kill` is the safe recovery path.
+process is wedged, `mullrun --kill` is the safe recovery path.
 
 ### Manual recovery
 
 ```bash
-vpn-run --kill
+mullrun --kill
 sudo /usr/local/bin/wgc kill mullvad
 sudo ip netns list
 sudo ip netns pids wgc_mullvad
@@ -736,18 +736,18 @@ If the namespace persists after all applications are gone:
 
 ```bash
 sudo ip netns del wgc_mullvad
-rm -rf /run/user/$(id -u)/vpn-run/state/mullvad
+rm -rf /run/user/$(id -u)/mullrun/state/mullvad
 ```
 
 The lock files can be left in place; they carry no state. If you remove the
-whole runtime directory, do it only after no `vpn-run` process is running.
+whole runtime directory, do it only after no `mullrun` process is running.
 
 ### Desktop integration
 
-Launch `vpn-run` from the graphical session that owns the application. If you
+Launch `mullrun` from the graphical session that owns the application. If you
 start it from a bare SSH shell, `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_*`, and
 `XDG_RUNTIME_DIR` may be absent; GUI applications will fail even though the
-tunnel is up. Use `vpn-run curl ...` for headless checks.
+tunnel is up. Use `mullrun curl ...` for headless checks.
 
 ## Security notes
 
@@ -783,10 +783,10 @@ The uninstaller:
    user runtime directory disappeared, then stops them;
 2. calls `wgc kill` for each tracked namespace (with a direct `ip netns del`
    fallback);
-3. removes `/usr/local/bin/vpn-run`;
-4. removes `/etc/sudoers.d/vpn-run-nopasswd`;
+3. removes `/usr/local/bin/mullrun`;
+4. removes `/etc/sudoers.d/mullrun-nopasswd`;
 5. removes installer-managed `/etc/wireguard/wgc_enable` (only if marked);
-6. cleans `/run/user/*/vpn-run/`.
+6. cleans `/run/user/*/mullrun/`.
 
 It asks before removing `/usr/local/bin/wgc` (default: keep). If you keep the
 wgc script and plan to use it directly, recreate

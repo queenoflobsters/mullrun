@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
-# uninstall.sh - remove vpn-run, its runtime state and its sudoers policy
+# uninstall.sh - remove mullrun, its runtime state and its sudoers policy
 # =============================================================================
 set -Eeuo pipefail
 IFS=$' \t\n'
 
 SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
-INSTALL_BIN="/usr/local/bin/vpn-run"
+INSTALL_BIN="/usr/local/bin/mullrun"
 WGC_BIN="/usr/local/bin/wgc"
-SUDOERS_FILE="/etc/sudoers.d/vpn-run-nopasswd"
+SUDOERS_FILE="/etc/sudoers.d/mullrun-nopasswd"
 WG_ENABLE="/etc/wireguard/wgc_enable"
-WG_ENABLE_MARKER="# Managed by mullrun/vpn-run install.sh"
+WG_ENABLE_MARKER="# Managed by mullrun install.sh"
 VPN_RE='^[A-Za-z0-9_-]{1,16}$'
 
 if [[ -t 1 && ${NO_COLOR:-} == "" && ${TERM:-} != "dumb" ]]; then
@@ -25,9 +25,9 @@ else
     C_RED=""
 fi
 
-info()  { printf '%s[vpn-run]%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
-warn()  { printf '%s[vpn-run]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
-error() { printf '%s[vpn-run]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+info()  { printf '%s[mullrun]%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+warn()  { printf '%s[mullrun]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+error() { printf '%s[mullrun]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 die()   { error "$*"; exit 1; }
 
 usage() {
@@ -39,8 +39,8 @@ Usage: sudo ./uninstall.sh [--yes] [--keep-wgc|--remove-wgc]
   --remove-wgc   Remove /usr/local/bin/wgc without asking
   --help         Show this help
 
-This stops namespaces tracked by vpn-run, removes /usr/local/bin/vpn-run,
-removes $SUDOERS_FILE, and cleans /run/user/*/vpn-run.
+This stops namespaces tracked by mullrun, removes /usr/local/bin/mullrun,
+removes $SUDOERS_FILE, and cleans /run/user/*/mullrun.
 EOF
 }
 
@@ -78,7 +78,7 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Stop every namespace tracked by vpn-run
+# Stop every namespace tracked by mullrun
 # ---------------------------------------------------------------------------
 shopt -s nullglob
 stopped_any=0
@@ -117,7 +117,7 @@ for proc_dir in /proc/[0-9]*; do
     [[ $supervisor_pid =~ ^[0-9]+$ ]] || continue
     [[ -r "$proc_dir/cmdline" ]] || continue
     cmdline=$(tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null || true)
-    [[ $cmdline == *"--internal-supervisor"* && $cmdline == *"/vpn-run"* ]] || continue
+    [[ $cmdline == *"--internal-supervisor"* && $cmdline == *"/mullrun"* ]] || continue
     read -r -a supervisor_args <<< "$cmdline"
     vpn=""
     for ((i = 0; i < ${#supervisor_args[@]} - 1; i++)); do
@@ -128,13 +128,13 @@ for proc_dir in /proc/[0-9]*; do
     done
     [[ $vpn =~ $VPN_RE ]] || continue
     tracked_vpns[$vpn]=1
-    info "Stopping vpn-run supervisor PID $supervisor_pid for VPN '$vpn'..."
+    info "Stopping mullrun supervisor PID $supervisor_pid for VPN '$vpn'..."
     kill -TERM "$supervisor_pid" 2>/dev/null || true
     sleep 0.2
     kill -KILL "$supervisor_pid" 2>/dev/null || true
 done
 
-for run_root in /run/user/*/vpn-run; do
+for run_root in /run/user/*/mullrun; do
     [[ -d $run_root ]] || continue
     state_root="$run_root/state"
     [[ -d $state_root ]] || continue
@@ -164,8 +164,8 @@ for run_root in /run/user/*/vpn-run; do
 done
 
 # Also catch a namespace whose user runtime directory vanished after logout
-# but whose vpn-run log still identifies it.
-for log_file in /run/user/*/vpn-run/logs/*.log; do
+# but whose mullrun log still identifies it.
+for log_file in /run/user/*/mullrun/logs/*.log; do
     [[ -f $log_file ]] || continue
     vpn=${log_file##*/}
     vpn=${vpn%.log}
@@ -177,11 +177,11 @@ for vpn in "${!tracked_vpns[@]}"; do
     stop_namespace "$vpn"
 done
 
-for run_root in /run/user/*/vpn-run; do
+for run_root in /run/user/*/mullrun; do
     [[ -e $run_root ]] || continue
     rm -rf -- "$run_root"
 done
-(( stopped_any == 0 )) && info "No active vpn-run namespace was found."
+(( stopped_any == 0 )) && info "No active mullrun namespace was found."
 
 # ---------------------------------------------------------------------------
 # Remove installed files

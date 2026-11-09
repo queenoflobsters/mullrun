@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2317  # dynamically dispatched test functions
 # =============================================================================
-# test_lifecycle.sh - hermetic lifecycle tests for bin/vpn-run
+# test_lifecycle.sh - hermetic lifecycle tests for bin/mullrun
 #
 # No root, real namespace, network access, or real wgc/ip is required.  Fake
 # wgc and ip binaries live in a private temporary directory and model the
@@ -12,7 +12,7 @@ IFS=$' \t\n'
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
-VPN_RUN="$ROOT_DIR/bin/vpn-run"
+VPN_RUN="$ROOT_DIR/bin/mullrun"
 TEST_FILE="$SCRIPT_DIR/test_lifecycle.sh"
 GRACE=1
 
@@ -32,7 +32,7 @@ fi
 
 PASS=0
 FAIL=0
-SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/vpn-run-tests.XXXXXX")
+SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/mullrun-tests.XXXXXX")
 chmod 700 "$SANDBOX"
 MOCKBIN="$SANDBOX/mockbin"
 APPBIN="$SANDBOX/appbin"
@@ -334,7 +334,7 @@ test_cli() {
     assert_contains "$CASE/help" "wgc_mullvad"
 
     "$VPN_RUN" --version > "$CASE/version" 2>&1
-    assert_contains "$CASE/version" "vpn-run 1.0.0"
+    assert_contains "$CASE/version" "mullrun 1.0.0"
 
     if "$VPN_RUN" > "$CASE/noargs" 2>&1; then
         return 1
@@ -587,7 +587,7 @@ test_environment_and_firefox() {
     assert_contains "$FIREFOX_ARGS" "--no-remote"
     assert_contains "$FIREFOX_ARGS" "--profile"
     assert_contains "$FIREFOX_ARGS" "about:blank"
-    local profile="$HOME/.local/share/vpn-run/firefox-profile"
+    local profile="$HOME/.local/share/mullrun/firefox-profile"
     test -d "$profile"
     assert_file_mode "$profile" "700"
 }
@@ -629,7 +629,7 @@ run_test() {
     fi
 }
 
-printf '%s\n' "vpn-run lifecycle tests"
+printf '%s\n' "mullrun lifecycle tests"
 printf '%s\n' "sandbox: $SANDBOX"
 
 run_test "static analysis and syntax" test_static

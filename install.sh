@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install.sh - install vpn-run, wgc and the required sudoers policy
+# install.sh - install mullrun, wgc and the required sudoers policy
 # =============================================================================
 set -Eeuo pipefail
 IFS=$' \t\n'
 
 SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
 SCRIPT_DIR=$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)
-INSTALL_BIN="/usr/local/bin/vpn-run"
+INSTALL_BIN="/usr/local/bin/mullrun"
 WGC_BIN="/usr/local/bin/wgc"
-SUDOERS_FILE="/etc/sudoers.d/vpn-run-nopasswd"
+SUDOERS_FILE="/etc/sudoers.d/mullrun-nopasswd"
 WG_DIR="/etc/wireguard"
 WG_CONFIG="$WG_DIR/mullvad.conf"
 WGC_ENABLE="$WG_DIR/wgc_enable"
 WGC_URL="https://raw.githubusercontent.com/colemar/wgc/main/wgc"
-WGC_ENABLE_MARKER="# Managed by mullrun/vpn-run install.sh - do not remove while wgc is in use."
+WGC_ENABLE_MARKER="# Managed by mullrun/mullrun install.sh - do not remove while wgc is in use."
 
 if [[ -t 1 && ${NO_COLOR:-} == "" && ${TERM:-} != "dumb" ]]; then
     C_RESET=$'\033[0m'
@@ -28,9 +28,9 @@ else
     C_RED=""
 fi
 
-info()  { printf '%s[vpn-run]%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
-warn()  { printf '%s[vpn-run]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
-error() { printf '%s[vpn-run]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+info()  { printf '%s[mullrun]%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+warn()  { printf '%s[mullrun]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+error() { printf '%s[mullrun]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 die()   { error "$*"; exit 1; }
 
 usage() {
@@ -41,13 +41,13 @@ Installs:
   - python3, wireguard-tools, iproute2/iproute, util-linux, curl, sudo,
     socat, and procps (using dnf or pacman)
   - /usr/local/bin/wgc from $WGC_URL (if not already installed)
-  - /usr/local/bin/vpn-run
+  - /usr/local/bin/mullrun
   - $SUDOERS_FILE for the wheel group (wgc and ip only)
 
 After installation, place a Mullvad WireGuard profile at:
   $WG_CONFIG   (mode 0600)
 
-Then run: vpn-run curl https://am.i.mullvad.net/connected
+Then run: mullrun curl https://am.i.mullvad.net/connected
 EOF
 }
 
@@ -72,7 +72,7 @@ fi
 # ---------------------------------------------------------------------------
 # Source validation and OS detection
 # ---------------------------------------------------------------------------
-[[ -f "$SCRIPT_DIR/bin/vpn-run" ]] || die "Missing source file: $SCRIPT_DIR/bin/vpn-run"
+[[ -f "$SCRIPT_DIR/bin/mullrun" ]] || die "Missing source file: $SCRIPT_DIR/bin/mullrun"
 [[ -f "$SCRIPT_DIR/uninstall.sh" ]] || die "Missing source file: $SCRIPT_DIR/uninstall.sh"
 [[ -f "$SCRIPT_DIR/README.md" ]] || die "Missing source file: $SCRIPT_DIR/README.md"
 
@@ -182,11 +182,11 @@ grep -q 'exec_in_namespace' "$WGC_BIN" || die "wgc does not provide the required
 "$WGC_BIN" req || warn "wgc dependency self-check reported problems; review its output above."
 
 # ---------------------------------------------------------------------------
-# vpn-run
+# mullrun
 # ---------------------------------------------------------------------------
 info "Installing $INSTALL_BIN..."
-install -o root -g root -m 0755 "$SCRIPT_DIR/bin/vpn-run" "$INSTALL_BIN"
-"$INSTALL_BIN" --help >/dev/null || die "Installed vpn-run failed to run '--help'."
+install -o root -g root -m 0755 "$SCRIPT_DIR/bin/mullrun" "$INSTALL_BIN"
+"$INSTALL_BIN" --help >/dev/null || die "Installed mullrun failed to run '--help'."
 if command -v restorecon >/dev/null 2>&1; then
     restorecon -F "$WGC_BIN" "$INSTALL_BIN" 2>/dev/null || true
 fi
@@ -211,13 +211,13 @@ for candidate in "$ip_primary" "$ip_real" /usr/bin/ip /sbin/ip /usr/sbin/ip /bin
 done
 (( ${#ip_paths[@]} > 0 )) || die "No executable ip path found."
 
-tmp_sudoers=$(mktemp /etc/sudoers.d/.vpn-run-nopasswd.XXXXXX)
+tmp_sudoers=$(mktemp /etc/sudoers.d/.mullrun-nopasswd.XXXXXX)
 cleanup_sudoers() { rm -f -- "$tmp_sudoers"; }
 trap cleanup_sudoers EXIT
 chown root:root "$tmp_sudoers"
 chmod 0440 "$tmp_sudoers"
 {
-    printf '%s\n' '# Managed by mullrun/vpn-run install.sh.'
+    printf '%s\n' '# Managed by mullrun/mullrun install.sh.'
     printf '%s\n' '# Passwordless execution is restricted to the exact commands below.'
     printf '%%wheel ALL=(root) NOPASSWD: %s\n' "$WGC_BIN"
     for ip_path in "${ip_paths[@]}"; do

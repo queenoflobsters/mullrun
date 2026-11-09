@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vpn-run: on-demand, reference-counted, auto-closing WireGuard launcher.
+"""mullrun: on-demand, reference-counted, auto-closing WireGuard launcher.
 
 The launcher wraps ``wgc`` and starts applications inside the network
 namespace created by ``wgc nup``.  A detached supervisor holds the life-cycle
@@ -27,7 +27,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-PROG = "vpn-run"
+PROG = "mullrun"
 VERSION = "1.0.0"
 DEFAULT_VPN = "mullvad"
 DEFAULT_GRACE = 5
@@ -273,7 +273,7 @@ def sudo_failure(stderr: str) -> bool:
 def sudo_hint() -> str:
     return (
         "Passwordless sudo for /usr/local/bin/wgc and /usr/bin/ip is required. "
-        "Re-run ./install.sh as root to install /etc/sudoers.d/vpn-run-nopasswd."
+        "Re-run ./install.sh as root to install /etc/sudoers.d/mullrun-nopasswd."
     )
 
 
@@ -370,7 +370,7 @@ def ensure_unprivileged() -> None:
     """Refuse to run the app as root.
 
     ``install.sh`` is the only component that should run as root.  If a user
-    invokes ``sudo vpn-run``, drop back to the original sudo user *before*
+    invokes ``sudo mullrun``, drop back to the original sudo user *before*
     touching runtime state so the inner ``wgc exec`` sees a normal user and
     performs its setpriv drop correctly.
     """
@@ -382,7 +382,7 @@ def ensure_unprivileged() -> None:
     sudo_gid = os.environ.get("SUDO_GID")
     if not sudo_uid:
         raise VpnRunError(
-            "Do not run vpn-run as root. Run it as your desktop user; it will "
+            "Do not run mullrun as root. Run it as your desktop user; it will "
             "use sudo only for wgc and ip."
         )
     try:
@@ -1198,7 +1198,7 @@ def ensure_supervisor(rt: Toolchain, layout: Layout, grace: int) -> Optional[int
 
     script = os.path.realpath(__file__)
     if not os.path.isfile(script):
-        raise VpnRunError("Cannot locate vpn-run script for supervisor: %s" % script)
+        raise VpnRunError("Cannot locate mullrun script for supervisor: %s" % script)
     last_error = "supervisor did not start"
     for _attempt in range(2):
         try:
