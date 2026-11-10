@@ -170,7 +170,7 @@ else
     [[ -s "$tmp_wgc" ]] || die "Downloaded wgc is empty."
     [[ $(stat -c '%s' "$tmp_wgc") -gt 10000 ]] || die "Downloaded wgc is implausibly small."
     head -n 1 "$tmp_wgc" | grep -q 'bash' || die "Downloaded wgc does not look like a Bash script."
-    bash -n "$tmp_wgc" || die "Downloaded wgc failed 'bash -n' syntax validation."
+    bash -O extglob -n "$tmp_wgc" || die "Downloaded wgc failed 'bash -n' syntax validation."
     grep -q 'WGC_CFGDIR' "$tmp_wgc" || die "Downloaded file does not look like the wgc implementation."
     install -o root -g root -m 0755 "$tmp_wgc" "$WGC_BIN"
     rm -f -- "$tmp_wgc"

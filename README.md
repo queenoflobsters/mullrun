@@ -43,23 +43,23 @@ $ mullrun --kill
  │  shell:  mullrun firefox                                             │
  │            │                                                         │
  │            ▼                                                         │
- │  ┌─────────────────────┐    shared flock     ┌────────────────────┐   │
- │  │ mullrun launcher    │────────────────────▶│ <vpn>.ref.lock     │   │
- │  │ (one per app)       │                     └────────────────────┘   │
- │  │  - holds ref lock   │                              ▲               │
- │  │  - registers PID    │                              │ exclusive     │
- │  │  - waits for app    │                     ┌────────┴───────────┐   │
- │  └─────────┬───────────┘                     │ detached supervisor │   │
- │            │ sudo -n wgc exec <vpn> <cmd>    │ - probes ref lock   │   │
- │            ▼                                 │ - reads netns PIDs  │   │
- │  ┌──────────────────────────────────────┐    │ - grace timer       │   │
- │  │ wgc_<vpn> network namespace          │    │ - wgc down / kill   │   │
- │  │                                      │    └────────┬───────────┘   │
- │  │  lo                                  │             │               │
- │  │  wgc_<vpn> (WireGuard interface)     │             │ sudo -n wgc   │
- │  │    default route → tunnel            │             ▼               │
- │  │  application (setpriv → UID 1000)    │       teardown after grace   │
- │  └──────────────────────────────────────┘                             │
+ │  ┌─────────────────────┐    shared flock     ┌────────────────────┐  │
+ │  │ mullrun launcher    │────────────────────▶│ <vpn>.ref.lock     │  │
+ │  │ (one per app)       │                     └────────────────────┘  │
+ │  │  - holds ref lock   │                              ▲              │
+ │  │  - registers PID    │                              │ exclusive    │
+ │  │  - waits for app    │                     ┌────────┴───────────┐  │
+ │  └─────────┬───────────┘                     │ detached supervisor│  │
+ │            │ sudo -n wgc exec <vpn> <cmd>    │ - probes ref lock  │  │
+ │            ▼                                 │ - reads netns PIDs │  │
+ │  ┌──────────────────────────────────────┐    │ - grace timer      │  │
+ │  │ wgc_<vpn> network namespace          │    │ - wgc down / kill  │  │
+ │  │                                      │    └────────┬───────────┘  │
+ │  │  lo                                  │             │              │
+ │  │  wgc_<vpn> (WireGuard interface)     │             │ sudo -n wgc  │
+ │  │    default route → tunnel            │             ▼              │
+ │  │  application (setpriv → UID 1000)    │       teardown after grace │
+ │  └──────────────────────────────────────┘                            │
  └──────────────────────────────────────────────────────────────────────┘
                                 host network untouched
 ```
@@ -299,23 +299,24 @@ cat /etc/mullrun/bridges.conf.example
 1. Sign in at <https://mullvad.net/en/account/wireguard-config>.
 2. Generate a WireGuard key pair for the device.
 3. Choose a server (or leave the automatic selection if offered by the page).
-4. Download the generated `.conf` file.
-5. Install it with root-only permissions:
+4. Download the generated archive file.
+5. Choose the desired configuration file (for instance `co-cit-wg-001.conf`)
+6. Install it with root-only permissions:
 
    ```bash
-   sudo install -d -o root -g root -m 0700 /etc/wireguard
-   sudo install -o root -g root -m 0600 \
-       ~/Downloads/mullvad-*.conf /etc/wireguard/mullvad.conf
+   sudo install -d -o root -g root -m 0755 /etc/wireguard
+   sudo chmod o+rx
+   sudo install -o root -g root -m 0600 ./co-cit-wg-001.conf /etc/wireguard/mullvad.conf
    sudo chmod 600 /etc/wireguard/mullvad.conf
    ```
 
-6. Validate the configuration with `wgc`:
+7. Validate the configuration with `wgc`:
 
    ```bash
    sudo /usr/local/bin/wgc parse mullvad
    ```
 
-7. Start a test through the namespace:
+8. Start a test through the namespace:
 
    ```bash
    mullrun curl https://am.i.mullvad.net/connected
@@ -327,7 +328,7 @@ cat /etc/mullrun/bridges.conf.example
    You are connected to Mullvad (server <name>). Your IP address is <address>
    ```
 
-8. Compare with the host (only meaningful if the host is not already on a
+9. Compare with the host (only meaningful if the host is not already on a
    Mullvad tunnel):
 
    ```bash
