@@ -11,8 +11,10 @@ Only the Python standard library is used.
 
 from __future__ import annotations
 
+import configparser
 import errno
 import fcntl
+import ipaddress
 import json
 import os
 import pwd
@@ -21,14 +23,15 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 PROG = "mullrun"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_VPN = "mullvad"
 DEFAULT_GRACE = 5
 DEFAULT_LOCK_TIMEOUT = 60
@@ -38,7 +41,14 @@ NAMESPACE_PREFIX = "wgc_"
 WGC_DEFAULT = "/usr/local/bin/wgc"
 IP_CANDIDATES = ("/usr/bin/ip", "/sbin/ip", "/usr/sbin/ip", "/bin/ip")
 SUDO_CANDIDATES = ("/usr/bin/sudo", "/bin/sudo", "/usr/local/bin/sudo")
+SOCAT_CANDIDATES = ("/usr/bin/socat", "/usr/local/bin/socat", "/bin/socat")
+BRIDGE_CONFIG_SYSTEM = "/etc/mullrun/bridges.conf"
+BRIDGE_MONITOR_INTERVAL = 10.0
+BRIDGE_START_DELAY = 0.3
+BRIDGE_STOP_GRACE = 3.0
+BRIDGE_SOCKET_TIMEOUT = 3.0
 VPN_RE = re.compile(r"^[A-Za-z0-9_-]{1,16}$")
+BRIDGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 POLL_INTERVAL = 0.5
 LOG_MAX_BYTES = 1024 * 1024
 
@@ -49,6 +59,10 @@ class VpnRunError(Exception):
 
 class UsageError(VpnRunError):
     """Invalid command line."""
+
+
+class BridgeError(VpnRunError):
+    """A bridge configuration or runtime failure."""
 
 
 # ---------------------------------------------------------------------------
@@ -518,12 +532,15 @@ class Layout:
         self.state_root = os.path.join(runtime_root, "state")
         self.state_dir = os.path.join(self.state_root, vpn)
         self.refs_dir = os.path.join(self.state_dir, "refs")
+        self.bridges_root = os.path.join(runtime_root, "bridges")
+        self.bridges_dir = os.path.join(self.bridges_root, vpn)
         self.ref_lock = os.path.join(self.locks_dir, "%s.ref.lock" % vpn)
         self.supervisor_lock = os.path.join(self.locks_dir, "%s.supervisor.lock" % vpn)
         self.lifecycle_lock = os.path.join(self.locks_dir, "%s.lifecycle.lock" % vpn)
         self.log_file = os.path.join(self.logs_dir, "%s.log" % vpn)
         self.state_file = os.path.join(self.state_dir, "state.json")
         self.pid_file = os.path.join(self.state_dir, "supervisor.pid")
+        self.bridge_state_file = os.path.join(self.state_dir, "bridges.json")
 
     def ensure(self, with_state: bool = True) -> None:
         _secure_dir(self.root)
@@ -1046,6 +1063,26 @@ def _find_sudo() -> str:
     raise VpnRunError("sudo not found. Re-run install.sh to install dependencies.")
 
 
+def _find_socat() -> str:
+    for candidate in SOCAT_CANDIDATES:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    found = shutil.which("socat")
+    if found:
+        return found
+    raise BridgeError("socat not found. Install the 'socat' package and re-run install.sh.")
+
+
+def _socat_override() -> Optional[str]:
+    if not is_test_mode():
+        return None
+    value = os.environ.get("VPN_RUN_SOCAT")
+    if value:
+        _validate_tool_override("VPN_RUN_SOCAT", value)
+        return value
+    return None
+
+
 def namespace_active(rt: Toolchain, vpn: str) -> Tuple[bool, str]:
     ns = namespace_name(vpn)
     rc, out, err = run_text(rt.ip_cmd(["netns", "list"]), timeout=10)
@@ -1090,18 +1127,28 @@ def namespace_pids(rt: Toolchain, vpn: str) -> Tuple[bool, List[int], str]:
     return False, [], ""
 
 
-def filter_wgc_bridge_pids(vpn: str, pids: Sequence[int]) -> List[int]:
-    """Ignore wgc's systemd/socket-proxyd bridge helpers.
+def filter_wgc_bridge_pids(
+    vpn: str,
+    pids: Sequence[int],
+    managed_pids: Sequence[int] = (),
+    bridge_dir: str = "",
+) -> List[int]:
+    """Ignore infrastructure relays that must not pin the namespace alive.
 
-    Bridges live in the namespace (and are root-owned), but they are
-    infrastructure, not applications.  Their environment/cgroup identifies
-    them reliably; if neither marker is readable we conservatively keep the
-    PID so the supervisor never tears down a namespace it cannot understand.
+    Besides wgc's own systemd/socket-proxyd helpers, mullrun's socat relay
+    inside the namespace is tracked in ``bridges.json`` and explicitly passed
+    as *managed_pids*.  A command-line fallback based on the per-VPN bridge
+    directory also catches a relay whose state write was lost.  If a process
+    cannot be classified we conservatively keep it, so a live application is
+    never killed by an idle timer.
     """
     kept: List[int] = []
+    managed = {pid for pid in managed_pids if isinstance(pid, int) and pid > 0}
     cgroup_marker_a = "wgc.%s." % vpn
     cgroup_marker_b = "wgc-%s-" % vpn
     for pid in pids:
+        if pid in managed:
+            continue
         is_bridge = False
         try:
             with open("/proc/%d/environ" % pid, "rb") as fh:
@@ -1117,11 +1164,25 @@ def filter_wgc_bridge_pids(vpn: str, pids: Sequence[int]) -> List[int]:
                     is_bridge = True
             except OSError:
                 pass
+        if not is_bridge and managed:
+            try:
+                if os.getpgid(pid) in managed:
+                    is_bridge = True
+            except OSError:
+                pass
+        if not is_bridge and bridge_dir:
+            args = process_cmdline(pid)
+            bridge_prefix = bridge_dir.rstrip("/") + "/"
+            if any(bridge_prefix in arg for arg in args) and any(
+                os.path.basename(arg) == "socat" or "socat" in os.path.basename(arg)
+                for arg in args
+            ):
+                is_bridge = True
         if not is_bridge:
             try:
                 with open("/proc/%d/comm" % pid, "r", encoding="utf-8", errors="replace") as fh:
                     comm = fh.read().strip()
-                if comm in ("systemd-socket-proxyd", "socat"):
+                if comm == "systemd-socket-proxyd":
                     is_bridge = True
             except OSError:
                 pass
@@ -1160,6 +1221,924 @@ def update_supervisor_state(layout: Layout, pid: Optional[int]) -> None:
         atomic_write_json(layout.state_file, data)
     except (VpnRunError, OSError):
         pass
+
+
+# ---------------------------------------------------------------------------
+# socat Unix-socket bridges
+# ---------------------------------------------------------------------------
+
+def bridge_config_paths() -> Tuple[str, str]:
+    """Return (user_config, system_config) paths, low precedence first."""
+    if is_test_mode():
+        system_override = os.environ.get("VPN_RUN_BRIDGE_CONFIG_SYSTEM")
+        user_override = os.environ.get("VPN_RUN_BRIDGE_CONFIG_USER")
+        if system_override:
+            if not os.path.isabs(system_override):
+                raise BridgeError("VPN_RUN_BRIDGE_CONFIG_SYSTEM must be absolute.")
+            system = system_override
+        else:
+            system = BRIDGE_CONFIG_SYSTEM
+        if user_override:
+            if not os.path.isabs(user_override):
+                raise BridgeError("VPN_RUN_BRIDGE_CONFIG_USER must be absolute.")
+            user = user_override
+        else:
+            user = ""
+        if not user:
+            home = os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+            config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+            if not os.path.isabs(config_home):
+                config_home = os.path.join(home, ".config")
+            user = os.path.join(config_home, PROG, "bridges.conf")
+        return user, system
+
+    home = os.environ.get("HOME")
+    if not home or not os.path.isabs(home):
+        try:
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except KeyError:
+            home = "/"
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if not config_home or not os.path.isabs(config_home):
+        config_home = os.path.join(home, ".config")
+    return os.path.join(config_home, PROG, "bridges.conf"), BRIDGE_CONFIG_SYSTEM
+
+
+class BridgeConfig:
+    """Validated configuration for one named bridge."""
+
+    def __init__(
+        self,
+        name: str,
+        vpn: str,
+        direction: str,
+        host_port: int,
+        netns_port: int,
+        host_addr: Union[ipaddress.IPv4Address, ipaddress.IPv6Address],
+        netns_addr: Union[ipaddress.IPv4Address, ipaddress.IPv6Address],
+        enabled: bool,
+        unsafe: bool,
+        source: str,
+    ):
+        self.name = name
+        self.vpn = vpn
+        self.direction = direction
+        self.host_port = host_port
+        self.netns_port = netns_port
+        self.host_addr = host_addr
+        self.netns_addr = netns_addr
+        self.enabled = enabled
+        self.unsafe = unsafe
+        self.source = source
+
+    @property
+    def inward(self) -> bool:
+        return self.direction == "host-to-netns"
+
+    def matches_vpn(self, vpn: str) -> bool:
+        return self.vpn == "*" or self.vpn == vpn
+
+    def identity(self) -> Tuple[str, str, int, str, int]:
+        return (
+            self.direction,
+            str(self.host_addr),
+            self.host_port,
+            str(self.netns_addr),
+            self.netns_port,
+        )
+
+    def endpoint_text(self, socket_path: str) -> str:
+        if self.host_addr.version == 6:
+            host = "[%s]:%d" % (self.host_addr, self.host_port)
+        else:
+            host = "%s:%d" % (self.host_addr, self.host_port)
+        if self.netns_addr.version == 6:
+            netns = "[%s]:%d" % (self.netns_addr, self.netns_port)
+        else:
+            netns = "%s:%d" % (self.netns_addr, self.netns_port)
+        if self.inward:
+            return "host unix:%s -> %s; %s -> netns unix:%s" % (
+                socket_path, host, netns, socket_path
+            )
+        return "%s -> host unix:%s; netns unix:%s -> %s" % (
+            host, socket_path, socket_path, netns
+        )
+
+
+class BridgeManager:
+    """Load, supervise and tear down unprivileged socat bridge pairs."""
+
+    def __init__(self, rt: Toolchain, layout: Layout):
+        self.rt = rt
+        self.layout = layout
+        self.vpn = layout.vpn
+        self.configs: Dict[str, BridgeConfig] = {}
+        self.config_errors: List[str] = []
+        self._socat_path: Optional[str] = None
+
+    # ----- configuration -------------------------------------------------
+    def _config_value(self, section: configparser.SectionProxy, key: str) -> str:
+        value = section.get(key)
+        if value is None:
+            raise BridgeError("missing required key '%s'" % key)
+        return value.strip()
+
+    def _config_bool(self, section: configparser.SectionProxy, key: str, default: bool) -> bool:
+        try:
+            return section.getboolean(key, fallback=default)
+        except ValueError:
+            raise BridgeError("%s must be true or false" % key)
+
+    def _config_port(self, section: configparser.SectionProxy, key: str) -> int:
+        raw = self._config_value(section, key)
+        if not re.fullmatch(r"[0-9]+", raw):
+            raise BridgeError("%s must be an integer between 1 and 65535" % key)
+        port = int(raw, 10)
+        if port < 1 or port > 65535:
+            raise BridgeError("%s must be between 1 and 65535" % key)
+        return port
+
+    def _config_addr(
+        self,
+        section: configparser.SectionProxy,
+        key: str,
+        unsafe: bool,
+    ) -> Union[ipaddress.IPv4Address, ipaddress.IPv6Address]:
+        raw = section.get(key, fallback="127.0.0.1").strip()
+        if "%" in raw:
+            raise BridgeError("%s must not contain an IPv6 zone identifier" % key)
+        try:
+            address = ipaddress.ip_address(raw)
+        except ValueError:
+            raise BridgeError("%s is not a valid IPv4 or IPv6 address: %r" % (key, raw))
+        if not address.is_loopback and not unsafe:
+            raise BridgeError(
+                "refusing non-loopback %s %r (set unsafe = true to override)"
+                % (key, raw)
+            )
+        return address
+
+    def _parse_section(
+        self,
+        name: str,
+        section: configparser.SectionProxy,
+        source: str,
+    ) -> BridgeConfig:
+        if not BRIDGE_NAME_RE.fullmatch(name):
+            raise BridgeError(
+                "invalid bridge name %r (use 1-64 alphanumeric, '_', '-', or '.')" % name
+            )
+        allowed = {
+            "vpn", "direction", "host_port", "netns_port",
+            "host_addr", "netns_addr", "enabled", "unsafe",
+        }
+        unknown = sorted(set(section.keys()) - allowed)
+        if unknown:
+            raise BridgeError("unknown key(s): %s" % ", ".join(unknown))
+        vpn = self._config_value(section, "vpn")
+        if vpn != "*":
+            try:
+                validate_vpn_name(vpn)
+            except UsageError as exc:
+                raise BridgeError(str(exc))
+        direction = self._config_value(section, "direction").lower()
+        if direction not in ("host-to-netns", "netns-to-host"):
+            raise BridgeError(
+                "direction must be 'host-to-netns' or 'netns-to-host'"
+            )
+        unsafe = self._config_bool(section, "unsafe", False)
+        host_port = self._config_port(section, "host_port")
+        netns_port = self._config_port(section, "netns_port")
+        host_addr = self._config_addr(section, "host_addr", unsafe)
+        netns_addr = self._config_addr(section, "netns_addr", unsafe)
+        enabled = self._config_bool(section, "enabled", True)
+        return BridgeConfig(
+            name=name,
+            vpn=vpn,
+            direction=direction,
+            host_port=host_port,
+            netns_port=netns_port,
+            host_addr=host_addr,
+            netns_addr=netns_addr,
+            enabled=enabled,
+            unsafe=unsafe,
+            source=source,
+        )
+
+    def _read_config_file(self, path: str) -> Tuple[Set[str], Dict[str, BridgeConfig], List[str]]:
+        errors: List[str] = []
+        if not path:
+            return set(), {}, errors
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return set(), {}, errors
+        except OSError as exc:
+            return set(), {}, ["%s: %s" % (path, exc)]
+        if stat.S_ISLNK(st.st_mode):
+            return set(), {}, ["%s: refusing symlinked bridge configuration" % path]
+        if not stat.S_ISREG(st.st_mode):
+            return set(), {}, ["%s: bridge configuration is not a regular file" % path]
+        if stat.S_IMODE(st.st_mode) & 0o022:
+            return set(), {}, ["%s: bridge configuration must not be group/world-writable" % path]
+        if path == BRIDGE_CONFIG_SYSTEM:
+            if st.st_uid != 0:
+                return set(), {}, ["%s: system bridge configuration must be owned by root" % path]
+        else:
+            if st.st_uid != os.geteuid():
+                return set(), {}, [
+                    "%s: user bridge configuration must be owned by UID %d" % (path, os.geteuid())
+                ]
+        parser = configparser.ConfigParser(
+            interpolation=None,
+            strict=True,
+            inline_comment_prefixes=("#", ";"),
+            empty_lines_in_values=False,
+        )
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "r", encoding="utf-8") as fh:
+                parser.read_file(fh, source=path)
+        except (OSError, UnicodeError, configparser.Error) as exc:
+            return set(), {}, ["%s: cannot parse bridge configuration: %s" % (path, exc)]
+        present = set(parser.sections())
+        configs: Dict[str, BridgeConfig] = {}
+        for section_name in parser.sections():
+            try:
+                configs[section_name] = self._parse_section(
+                    section_name, parser[section_name], path
+                )
+            except BridgeError as exc:
+                errors.append("%s: [%s] %s" % (path, section_name, exc))
+        return present, configs, errors
+
+    def load_configs(self, log_errors: bool = True) -> Dict[str, BridgeConfig]:
+        try:
+            user_path, system_path = bridge_config_paths()
+        except BridgeError as exc:
+            self.config_errors = [str(exc)]
+            if log_errors:
+                log_warn(str(exc))
+            self.configs = {}
+            return {}
+        merged: Dict[str, BridgeConfig] = {}
+        errors: List[str] = []
+        for path in (system_path, user_path):
+            if not path:
+                continue
+            present, configs, file_errors = self._read_config_file(path)
+            errors.extend(file_errors)
+            # A higher-priority file owns every section it declares, even if
+            # that section fails validation.  This prevents a user from
+            # accidentally falling back to a less-restrictive system entry.
+            for section_name in present:
+                merged.pop(section_name, None)
+            merged.update(configs)
+        self.configs = merged
+        self.config_errors = errors
+        if log_errors:
+            for message in errors:
+                log_warn(message)
+        return dict(merged)
+
+    def active_configs(self, log_warnings: bool = True) -> Dict[str, BridgeConfig]:
+        active: Dict[str, BridgeConfig] = {}
+        seen_host: Set[Tuple[str, int]] = set()
+        seen_netns: Set[Tuple[str, int]] = set()
+        for name, config in sorted(self.configs.items()):
+            if not config.enabled or not config.matches_vpn(self.vpn):
+                continue
+            if config.inward:
+                key = (str(config.netns_addr), config.netns_port)
+                seen = seen_netns
+                label = "netns listener"
+            else:
+                key = (str(config.host_addr), config.host_port)
+                seen = seen_host
+                label = "host listener"
+            if key in seen:
+                message = (
+                    "bridge '%s' conflicts with another bridge on %s %s:%d"
+                    % (name, label, key[0], key[1])
+                )
+                self.config_errors.append(message)
+                if log_warnings:
+                    log_warn(message)
+                continue
+            seen.add(key)
+            active[name] = config
+        return active
+
+    # ----- paths and socat helpers ---------------------------------------
+    def _require_socat(self) -> str:
+        if self._socat_path:
+            return self._socat_path
+        override = _socat_override()
+        self._socat_path = override or _find_socat()
+        return self._socat_path
+
+    def _ensure_bridge_dir(self) -> None:
+        _secure_dir(self.layout.root)
+        _secure_dir(self.layout.bridges_root)
+        _secure_dir(self.layout.bridges_dir)
+
+    def _socket_path(self, name: str) -> str:
+        path = os.path.join(self.layout.bridges_dir, "%s.sock" % name)
+        if "," in path or "\n" in path:
+            raise BridgeError("bridge runtime path contains a character unsupported by socat")
+        if len(os.fsencode(path)) >= 100:
+            raise BridgeError("bridge socket path is too long for a Unix socket: %s" % path)
+        root = os.path.realpath(self.layout.root)
+        parent = os.path.realpath(os.path.dirname(path))
+        if os.path.commonpath([root, parent]) != root:
+            raise BridgeError("bridge socket path escapes the mullrun runtime directory")
+        return path
+
+    def _prepare_socket(self, path: str) -> None:
+        if "," in path or "\n" in path:
+            raise BridgeError("bridge socket path contains a character unsupported by socat")
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise BridgeError("cannot inspect bridge socket %s: %s" % (path, exc))
+        if stat.S_ISLNK(st.st_mode):
+            raise BridgeError("refusing symlinked bridge socket path: %s" % path)
+        if stat.S_ISSOCK(st.st_mode):
+            try:
+                os.unlink(path)
+            except OSError as exc:
+                raise BridgeError("cannot remove stale bridge socket %s: %s" % (path, exc))
+            return
+        raise BridgeError("refusing to remove non-socket bridge path: %s" % path)
+
+    def _wait_for_socket(self, path: str, processes: Sequence[subprocess.Popen]) -> None:
+        deadline = time.monotonic() + BRIDGE_SOCKET_TIMEOUT
+        while time.monotonic() < deadline:
+            for process in processes:
+                if process.poll() is not None:
+                    raise BridgeError(
+                        "socat relay exited with status %d before creating the socket"
+                        % process.returncode
+                    )
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                time.sleep(0.05)
+                continue
+            except OSError as exc:
+                raise BridgeError("cannot inspect bridge socket %s: %s" % (path, exc))
+            if stat.S_ISLNK(st.st_mode):
+                raise BridgeError("refusing symlinked bridge socket: %s" % path)
+            if not stat.S_ISSOCK(st.st_mode):
+                raise BridgeError("bridge path is not a Unix socket: %s" % path)
+            if st.st_uid != os.geteuid():
+                raise BridgeError("bridge socket is not owned by the invoking user: %s" % path)
+            os.chmod(path, 0o600)
+            return
+        raise BridgeError("timed out waiting for bridge socket %s" % path)
+
+    def _tcp_target(self, address: Union[ipaddress.IPv4Address, ipaddress.IPv6Address], port: int) -> str:
+        if address.version == 6:
+            return "TCP6:[%s]:%d" % (address, port)
+        return "TCP4:%s:%d" % (address, port)
+
+    def _tcp_listener(self, address: Union[ipaddress.IPv4Address, ipaddress.IPv6Address], port: int) -> str:
+        if address.version == 6:
+            return "TCP6-LISTEN:%d,bind=[%s],fork,reuseaddr" % (port, address)
+        return "TCP4-LISTEN:%d,bind=%s,fork,reuseaddr" % (port, address)
+
+    def _unix_listener(self, path: str) -> str:
+        return "UNIX-LISTEN:%s,fork,unlink-early,mode=0600" % path
+
+    def _unix_target(self, path: str) -> str:
+        return "UNIX-CONNECT:%s" % path
+
+    def _host_listener_free(self, config: BridgeConfig) -> None:
+        family = socket.AF_INET6 if config.host_addr.version == 6 else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock.bind((str(config.host_addr), config.host_port))
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                raise BridgeError(
+                    "host listener %s:%d is already in use"
+                    % (config.host_addr, config.host_port)
+                )
+            raise BridgeError(
+                "cannot bind host listener %s:%d: %s"
+                % (config.host_addr, config.host_port, exc)
+            )
+        finally:
+            sock.close()
+
+    def _bridge_commands(self, config: BridgeConfig, socket_path: str) -> Tuple[List[str], List[str]]:
+        socat = self._require_socat()
+        if config.inward:
+            host_args = [
+                self._unix_listener(socket_path),
+                self._tcp_target(config.host_addr, config.host_port),
+            ]
+            netns_args = [
+                self._tcp_listener(config.netns_addr, config.netns_port),
+                self._unix_target(socket_path),
+            ]
+        else:
+            host_args = [
+                self._tcp_listener(config.host_addr, config.host_port),
+                self._unix_target(socket_path),
+            ]
+            netns_args = [
+                self._unix_listener(socket_path),
+                self._tcp_target(config.netns_addr, config.netns_port),
+            ]
+        host_cmd = [socat] + host_args
+        netns_cmd = self.rt.wgc_cmd(["exec", self.vpn, socat] + netns_args)
+        return host_cmd, netns_cmd
+
+    def _spawn(self, command: Sequence[str], log_path: str) -> subprocess.Popen:
+        try:
+            rotate_log(log_path)
+        except VpnRunError:
+            pass
+        log_fd = open_append_secure(log_path)
+        try:
+            return subprocess.Popen(
+                list(command),
+                stdin=subprocess.DEVNULL,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                start_new_session=True,
+                cwd="/",
+                env=dict(os.environ),
+            )
+        finally:
+            os.close(log_fd)
+
+    def _pid_matches(self, pid: Any, start_time: Any) -> bool:
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        if not pid_alive(pid):
+            return False
+        if isinstance(start_time, int) and start_time > 0:
+            return proc_start_time(pid) == start_time
+        return True
+
+    def _terminate_pids(self, entries: Sequence[Tuple[int, int]]) -> None:
+        pending: List[Tuple[int, int]] = []
+        for pid, start in entries:
+            if pid != os.getpid() and self._pid_matches(pid, start):
+                pending.append((pid, start))
+        if not pending:
+            return
+
+        def signal_bridge(pid: int, signum: int) -> None:
+            try:
+                # Both relays are launched with start_new_session=True, so the
+                # listener PID is its process-group leader.  killpg also reaps
+                # socat's per-connection fork children.
+                if os.getpgid(pid) == pid:
+                    os.killpg(pid, signum)
+                else:
+                    os.kill(pid, signum)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                log_warn("Not permitted to signal bridge PID %d: %s" % (pid, exc))
+
+        for pid, _start in pending:
+            signal_bridge(pid, signal.SIGTERM)
+        deadline = time.monotonic() + BRIDGE_STOP_GRACE
+        while time.monotonic() < deadline:
+            pending = [(pid, start) for pid, start in pending if self._pid_matches(pid, start)]
+            if not pending:
+                return
+            time.sleep(0.05)
+        for pid, _start in pending:
+            signal_bridge(pid, signal.SIGKILL)
+
+    def _unlink_socket(self, path: Any) -> None:
+        if not isinstance(path, str) or not path:
+            return
+        try:
+            root = os.path.realpath(self.layout.bridges_dir)
+            parent = os.path.realpath(os.path.dirname(path))
+            if os.path.commonpath([root, parent]) != root:
+                log_warn("Refusing to unlink bridge path outside runtime directory: %s" % path)
+                return
+        except (OSError, ValueError):
+            return
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            log_warn("Cannot inspect bridge socket %s: %s" % (path, exc))
+            return
+        if stat.S_ISDIR(st.st_mode):
+            log_warn("Refusing to unlink bridge directory path: %s" % path)
+            return
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            log_warn("Cannot remove bridge socket %s: %s" % (path, exc))
+
+    # ----- persistent bridge state ---------------------------------------
+    def _read_state(self) -> List[Dict[str, Any]]:
+        data = read_json(self.layout.bridge_state_file)
+        if not data:
+            return []
+        records = data.get("bridges")
+        if not isinstance(records, list):
+            return []
+        result: List[Dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            name = record.get("name")
+            if isinstance(name, str) and BRIDGE_NAME_RE.fullmatch(name):
+                result.append(record)
+        return result
+
+    def _write_state(self, records: Sequence[Dict[str, Any]]) -> None:
+        if not records:
+            try:
+                os.unlink(self.layout.bridge_state_file)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log_warn("Cannot remove bridge state: %s" % exc)
+            return
+        _secure_dir(self.layout.state_dir)
+        atomic_write_json(
+            self.layout.bridge_state_file,
+            {"version": 1, "vpn": self.vpn, "bridges": list(records)},
+        )
+
+    def _record_matches(self, record: Dict[str, Any], config: BridgeConfig) -> bool:
+        return (
+            record.get("name") == config.name
+            and record.get("direction") == config.direction
+            and record.get("host_addr") == str(config.host_addr)
+            and record.get("host_port") == config.host_port
+            and record.get("netns_addr") == str(config.netns_addr)
+            and record.get("netns_port") == config.netns_port
+        )
+
+    def _record_alive(self, record: Optional[Dict[str, Any]], config: BridgeConfig) -> bool:
+        if not record or not self._record_matches(record, config):
+            return False
+        if not self._pid_matches(record.get("host_pid"), record.get("host_start_time")):
+            return False
+        if not self._pid_matches(record.get("netns_pid"), record.get("netns_start_time")):
+            return False
+        socket_path = record.get("socket")
+        if not isinstance(socket_path, str):
+            return False
+        try:
+            st = os.lstat(socket_path)
+        except OSError:
+            return False
+        return stat.S_ISSOCK(st.st_mode) and not stat.S_ISLNK(st.st_mode)
+
+    # ----- lifecycle ------------------------------------------------------
+    def _start_bridge(self, config: BridgeConfig, verbose: bool) -> Dict[str, Any]:
+        self._ensure_bridge_dir()
+        socket_path = self._socket_path(config.name)
+        if not config.inward:
+            self._host_listener_free(config)
+        self._prepare_socket(socket_path)
+        host_cmd, netns_cmd = self._bridge_commands(config, socket_path)
+        host_log = os.path.join(self.layout.bridges_dir, "%s.host.log" % config.name)
+        netns_log = os.path.join(self.layout.bridges_dir, "%s.netns.log" % config.name)
+        host_process: Optional[subprocess.Popen] = None
+        netns_process: Optional[subprocess.Popen] = None
+        try:
+            host_process = self._spawn(host_cmd, host_log)
+            netns_process = self._spawn(netns_cmd, netns_log)
+            time.sleep(BRIDGE_START_DELAY)
+            for side, process, log_path in (
+                ("host", host_process, host_log),
+                ("netns", netns_process, netns_log),
+            ):
+                rc = process.poll()
+                if rc is not None:
+                    tail = read_log_tail(log_path)
+                    raise BridgeError(
+                        "socat %s relay exited with status %d%s"
+                        % (side, rc, (": " + tail.replace("\n", " ")) if tail else "")
+                    )
+            self._wait_for_socket(socket_path, [host_process, netns_process])
+            # Give socat a short stabilization window after the socket
+            # appears; this catches a namespace listener that fails just
+            # after the host-side Unix socket was created.
+            time.sleep(0.1)
+            for side, process, log_path in (
+                ("host", host_process, host_log),
+                ("netns", netns_process, netns_log),
+            ):
+                rc = process.poll()
+                if rc is not None:
+                    tail = read_log_tail(log_path)
+                    raise BridgeError(
+                        "socat %s relay exited with status %d%s"
+                        % (side, rc, (": " + tail.replace("\n", " ")) if tail else "")
+                    )
+        except Exception:
+            self._terminate_pids(
+                [
+                    (host_process.pid, proc_start_time(host_process.pid) or 0) if host_process else (0, 0),
+                    (netns_process.pid, proc_start_time(netns_process.pid) or 0) if netns_process else (0, 0),
+                ]
+            )
+            self._unlink_socket(socket_path)
+            raise
+        if config.unsafe and (
+            not config.host_addr.is_loopback or not config.netns_addr.is_loopback
+        ):
+            log_warn(
+                "Bridge '%s' deliberately uses a non-loopback address; verify your threat model."
+                % config.name
+            )
+        record = {
+            "name": config.name,
+            "vpn": self.vpn,
+            "direction": config.direction,
+            "host_addr": str(config.host_addr),
+            "host_port": config.host_port,
+            "netns_addr": str(config.netns_addr),
+            "netns_port": config.netns_port,
+            "socket": socket_path,
+            "host_pid": host_process.pid,
+            "host_start_time": proc_start_time(host_process.pid) or 0,
+            "netns_pid": netns_process.pid,
+            "netns_start_time": proc_start_time(netns_process.pid) or 0,
+            "started_at": time.time(),
+            "error": "",
+        }
+        if verbose:
+            log_info(
+                "Bridge '%s' started (%s): %s"
+                % (config.name, config.direction, config.endpoint_text(socket_path))
+            )
+        else:
+            log_info(
+                "Bridge '%s' restarted (%s)." % (config.name, config.direction)
+            )
+        return record
+
+    def _stop_record(self, record: Dict[str, Any], verbose: bool = True) -> None:
+        entries: List[Tuple[int, int]] = []
+        for pid_key, start_key in (("host_pid", "host_start_time"), ("netns_pid", "netns_start_time")):
+            pid = record.get(pid_key)
+            start = record.get(start_key)
+            if not isinstance(pid, int) or pid <= 0:
+                continue
+            try:
+                start_i = int(start or 0)
+            except (TypeError, ValueError):
+                start_i = 0
+            entries.append((pid, start_i))
+        self._terminate_pids(entries)
+        self._unlink_socket(record.get("socket"))
+        if verbose and record.get("name"):
+            log_info("Bridge '%s' stopped." % record.get("name"))
+
+    def _scan_bridge_pids(self) -> List[Tuple[int, int]]:
+        found: List[Tuple[int, int]] = []
+        needle = self.layout.bridges_dir.rstrip("/") + "/"
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return found
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == os.getpid():
+                continue
+            args = process_cmdline(pid)
+            if not args:
+                continue
+            if not any(needle in arg for arg in args):
+                continue
+            if not any(os.path.basename(arg) == "socat" or "socat" in os.path.basename(arg) for arg in args):
+                continue
+            found.append((pid, proc_start_time(pid) or 0))
+        return found
+
+    def _cleanup_bridge_dir(self) -> None:
+        try:
+            shutil.rmtree(self.layout.bridges_dir)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log_warn("Cannot remove bridge directory %s: %s" % (self.layout.bridges_dir, exc))
+        try:
+            os.rmdir(self.layout.bridges_root)
+        except OSError:
+            pass
+
+    def stop_all(self, verbose: bool = True) -> int:
+        records = self._read_state()
+        entries: List[Tuple[int, int]] = []
+        sockets: List[str] = []
+        for record in records:
+            for key, start_key in (("host_pid", "host_start_time"), ("netns_pid", "netns_start_time")):
+                value = record.get(key)
+                if isinstance(value, int) and value > 0:
+                    try:
+                        start_value = int(record.get(start_key) or 0)
+                    except (TypeError, ValueError):
+                        start_value = 0
+                    entries.append((value, start_value))
+            socket_path = record.get("socket")
+            if isinstance(socket_path, str):
+                sockets.append(socket_path)
+        entries.extend(self._scan_bridge_pids())
+        # De-duplicate by PID.
+        unique: Dict[int, int] = {}
+        for pid, start in entries:
+            if pid > 0 and pid != os.getpid():
+                if pid not in unique or (unique[pid] == 0 and start > 0):
+                    unique[pid] = start
+        if unique:
+            self._terminate_pids([(pid, start) for pid, start in unique.items()])
+            if verbose:
+                log_info("Stopped %d bridge relay process(es)." % len(unique))
+        for socket_path in sockets:
+            self._unlink_socket(socket_path)
+        if os.path.isdir(self.layout.bridges_dir):
+            for name in os.listdir(self.layout.bridges_dir):
+                if not name.endswith(".sock"):
+                    continue
+                self._unlink_socket(os.path.join(self.layout.bridges_dir, name))
+        try:
+            self._write_state([])
+        except Exception as exc:  # noqa: BLE001 - cleanup must continue
+            log_warn("Cannot remove bridge state during cleanup: %s" % exc)
+        self._cleanup_bridge_dir()
+        return len(unique)
+
+    def reconcile(self, verbose: bool = True) -> List[Dict[str, Any]]:
+        self.load_configs(log_errors=verbose)
+        if (
+            not self.configs
+            and not os.path.exists(self.layout.bridge_state_file)
+            and not os.path.isdir(self.layout.bridges_dir)
+        ):
+            return []
+        desired = self.active_configs(log_warnings=verbose)
+        old_records = {record.get("name"): record for record in self._read_state()}
+        known_pids: Set[int] = set()
+        for record in old_records.values():
+            for key in ("host_pid", "netns_pid"):
+                value = record.get(key)
+                if isinstance(value, int) and value > 0:
+                    known_pids.add(value)
+        orphans: List[Tuple[int, int]] = []
+        for pid, start in self._scan_bridge_pids():
+            if pid in known_pids:
+                continue
+            # socat's per-connection fork children inherit the listener's
+            # process group.  Do not kill healthy connection handlers as
+            # "orphans" during a periodic reconcile.
+            try:
+                if os.getpgid(pid) in known_pids:
+                    continue
+            except OSError:
+                continue
+            orphans.append((pid, start))
+        if orphans:
+            if verbose:
+                log_warn("Stopping %d orphaned bridge relay process(es)." % len(orphans))
+            self._terminate_pids(orphans)
+        records: List[Dict[str, Any]] = []
+        for name, record in sorted(old_records.items()):
+            config = desired.get(name)
+            if config is None or not self._record_matches(record, config):
+                self._stop_record(record, verbose=verbose)
+            elif not self._record_alive(record, config):
+                self._stop_record(record, verbose=verbose)
+        for name, config in sorted(desired.items()):
+            old = old_records.get(name)
+            if old and self._record_matches(old, config) and self._record_alive(old, config):
+                old["error"] = ""
+                records.append(old)
+                continue
+            try:
+                records.append(self._start_bridge(config, verbose=verbose))
+            except Exception as exc:  # noqa: BLE001 - a bridge must not kill the app
+                message = "Bridge '%s' unavailable: %s" % (name, exc)
+                log_warn(message)
+                try:
+                    error_socket = self._socket_path(name)
+                except BridgeError:
+                    error_socket = ""
+                records.append(
+                    {
+                        "name": name,
+                        "vpn": self.vpn,
+                        "direction": config.direction,
+                        "host_addr": str(config.host_addr),
+                        "host_port": config.host_port,
+                        "netns_addr": str(config.netns_addr),
+                        "netns_port": config.netns_port,
+                        "socket": error_socket,
+                        "host_pid": 0,
+                        "host_start_time": 0,
+                        "netns_pid": 0,
+                        "netns_start_time": 0,
+                        "started_at": time.time(),
+                        "error": str(exc),
+                    }
+                )
+        self._write_state(records)
+        if not records and not desired:
+            self._cleanup_bridge_dir()
+        return records
+
+    def status_entries(self) -> Tuple[List[Dict[str, Any]], List[str]]:
+        self.load_configs(log_errors=False)
+        records = {record.get("name"): record for record in self._read_state()}
+        result: List[Dict[str, Any]] = []
+        for name, config in sorted(self.configs.items()):
+            if not config.matches_vpn(self.vpn):
+                continue
+            record = records.pop(name, None)
+            alive = self._record_alive(record, config) if config.enabled else False
+            if not config.enabled:
+                state = "disabled"
+            elif alive:
+                state = "running"
+            elif record and record.get("error"):
+                state = "error"
+            elif record:
+                state = "stale"
+            else:
+                state = "not started"
+            config_error = ""
+            try:
+                socket_path = self._socket_path(name)
+            except BridgeError as exc:
+                socket_path = ""
+                config_error = str(exc)
+                if state != "disabled":
+                    state = "error"
+            result.append(
+                {
+                    "name": name,
+                    "direction": config.direction,
+                    "vpn": config.vpn,
+                    "state": state,
+                    "host_pid": record.get("host_pid", 0) if record else 0,
+                    "netns_pid": record.get("netns_pid", 0) if record else 0,
+                    "socket": socket_path,
+                    "endpoints": config.endpoint_text(socket_path) if socket_path else "",
+                    "error": config_error or (record.get("error", "") if record else ""),
+                }
+            )
+        for name, record in sorted(records.items()):
+            if record.get("vpn") not in (None, "*", self.vpn):
+                continue
+            result.append(
+                {
+                    "name": name,
+                    "direction": record.get("direction", "?"),
+                    "vpn": record.get("vpn", "?"),
+                    "state": "orphan",
+                    "host_pid": record.get("host_pid", 0),
+                    "netns_pid": record.get("netns_pid", 0),
+                    "socket": record.get("socket", ""),
+                    "endpoints": "",
+                    "error": record.get("error", ""),
+                }
+            )
+        return result, list(self.config_errors)
+
+
+def managed_bridge_pids(layout: Layout) -> Set[int]:
+    data = read_json(layout.bridge_state_file)
+    result: Set[int] = set()
+    if not data:
+        return result
+    records = data.get("bridges")
+    if not isinstance(records, list):
+        return result
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        pid = record.get("netns_pid")
+        start = record.get("netns_start_time")
+        if isinstance(pid, int) and pid > 0 and pid_alive(pid):
+            if not isinstance(start, int) or start <= 0 or proc_start_time(pid) == start:
+                result.add(pid)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1313,10 +2292,20 @@ def teardown_locked(rt: Toolchain, layout: Layout, vpn: str, grace: int) -> str:
         if err:
             log_warn("Cannot inspect namespace PID set: %s" % err)
             return "retry"
-        pids = filter_wgc_bridge_pids(vpn, raw_pids) if active else []
+        pids = (
+            filter_wgc_bridge_pids(
+                vpn, raw_pids, managed_bridge_pids(layout), layout.bridges_dir
+            )
+            if active
+            else []
+        )
         if pids:
             log_info("Namespace still has %d live process(es); postponing teardown." % len(pids))
             return "reset"
+        try:
+            BridgeManager(rt, layout).stop_all(verbose=True)
+        except Exception as exc:  # noqa: BLE001 - bridge cleanup must not block teardown
+            log_warn("Bridge cleanup during teardown failed: %s" % exc)
         if not active:
             remove_state_dir(layout)
             log_info("VPN '%s' was already down; runtime state removed." % vpn)
@@ -1335,7 +2324,13 @@ def teardown_locked(rt: Toolchain, layout: Layout, vpn: str, grace: int) -> str:
         except VpnRunError as exc:
             log_warn("Could not verify teardown for '%s': %s" % (vpn, exc))
             return "retry"
-        pids2 = filter_wgc_bridge_pids(vpn, raw2) if active2 else []
+        pids2 = (
+            filter_wgc_bridge_pids(
+                vpn, raw2, managed_bridge_pids(layout), layout.bridges_dir
+            )
+            if active2
+            else []
+        )
         if err2 or active2 or pids2:
             if err2:
                 log_warn("Teardown verification failed: %s" % err2)
@@ -1510,6 +2505,10 @@ def launch_app(rt: Toolchain, layout: Layout, vpn: str, command: Sequence[str], 
         supervisor = ensure_supervisor(rt, layout, grace)
         if supervisor:
             log_debug("auto-teardown supervisor is PID %d" % supervisor)
+        try:
+            BridgeManager(rt, layout).reconcile(verbose=True)
+        except Exception as exc:  # noqa: BLE001 - bridges must never block the app
+            log_warn("Bridge setup skipped: %s" % exc)
         app_command, firefox_profile = isolate_firefox(command)
         if firefox_profile:
             log_info("Firefox detected: using isolated profile %s" % firefox_profile)
@@ -1602,6 +2601,36 @@ def _print_ps(pids: Sequence[int]) -> None:
         print("  " + line.strip())
 
 
+def _print_bridge_status(rt: Toolchain, layout: Layout) -> None:
+    print("")
+    print(color_stdout("Active Bridges", "1;34"))
+    try:
+        manager = BridgeManager(rt, layout)
+        entries, errors = manager.status_entries()
+    except Exception as exc:  # noqa: BLE001 - status must stay usable
+        log_warn("Cannot load bridge status: %s" % exc)
+        print("  (unavailable)")
+        return
+    if not entries:
+        print("  (none configured)")
+    for entry in entries:
+        pids = "host=%s netns=%s" % (
+            entry.get("host_pid") or "-",
+            entry.get("netns_pid") or "-",
+        )
+        print(
+            "  %-18s %-14s %-10s %s"
+            % (entry.get("name", "?"), entry.get("direction", "?"), entry.get("state", "?"), pids)
+        )
+        endpoints = entry.get("endpoints") or ""
+        if endpoints:
+            print("    endpoints: %s" % endpoints)
+        if entry.get("error"):
+            print("    error: %s" % str(entry["error"]).replace("\n", " "))
+    for message in errors:
+        log_warn(message)
+
+
 def cmd_status(rt: Toolchain, layout: Layout) -> int:
     vpn = layout.vpn
     state = state_load(layout)
@@ -1643,6 +2672,7 @@ def cmd_status(rt: Toolchain, layout: Layout) -> int:
     else:
         print("Supervisor:    not running")
     print("Runtime:       %s" % layout.root)
+    _print_bridge_status(rt, layout)
 
     if error:
         log_warn(error)
@@ -1709,6 +2739,11 @@ def cmd_kill(rt: Toolchain, layout: Layout) -> int:
             log_info("Stopping auto-teardown supervisor (PID %d)..." % sup)
             if not stop_process(sup, "supervisor", 3.0):
                 log_warn("Supervisor PID %d did not exit." % sup)
+
+        try:
+            BridgeManager(rt, layout).stop_all(verbose=True)
+        except Exception as exc:  # noqa: BLE001 - force kill must proceed
+            log_warn("Bridge cleanup during --kill failed: %s" % exc)
 
         active, pids, err = namespace_pids(rt, vpn)
         if err:
@@ -1787,6 +2822,7 @@ def supervisor_run(vpn: str, initial_grace: int) -> int:
         idle_since: Optional[float] = None
         idle_logged = False
         active_logged = False
+        bridge_check_at = 0.0
         while not stop["flag"]:
             try:
                 ref_fd = try_exclusive_ref(layout)
@@ -1802,11 +2838,31 @@ def supervisor_run(vpn: str, initial_grace: int) -> int:
                     if not active_logged:
                         _supervisor_log("namespace active (references held).")
                         active_logged = True
+                    now = time.monotonic()
+                    if now >= bridge_check_at:
+                        bridge_check_at = now + BRIDGE_MONITOR_INTERVAL
+                        try:
+                            bridge_life = acquire_lifecycle(layout, timeout=1)
+                            try:
+                                if namespace_active(rt, vpn)[0]:
+                                    BridgeManager(rt, layout).reconcile(verbose=False)
+                            finally:
+                                os.close(bridge_life)
+                        except VpnRunError as exc:
+                            _supervisor_log("bridge monitor skipped: %s" % exc)
+                        except Exception as exc:  # noqa: BLE001 - supervisor stays alive
+                            _supervisor_log("bridge monitor error: %s" % exc)
                 else:
                     active, raw_pids, ns_error = namespace_pids(rt, vpn)
                     if ns_error:
                         raise VpnRunError(ns_error)
-                    pids = filter_wgc_bridge_pids(vpn, raw_pids) if active else []
+                    pids = (
+                        filter_wgc_bridge_pids(
+                            vpn, raw_pids, managed_bridge_pids(layout), layout.bridges_dir
+                        )
+                        if active
+                        else []
+                    )
                     if not pids:
                         if idle_since is None:
                             idle_since = time.monotonic()
@@ -1998,6 +3054,10 @@ def print_help() -> None:
     print("     processes, then tears the tunnel down after the grace period.")
     print("  4. If an app segfaults or is killed -9, namespace PID monitoring keeps")
     print("     the tunnel alive until its children also exit.")
+    print("")
+    print(bold("Service bridges:"))
+    print("  ~/.config/mullrun/bridges.conf or /etc/mullrun/bridges.conf")
+    print("  See README.md and 'mullrun --status' (Active Bridges).")
     print("")
     print(bold("Environment:"))
     print("  XDG_RUNTIME_DIR             Secure per-user runtime directory")

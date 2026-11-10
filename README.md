@@ -25,12 +25,13 @@ $ mullrun --kill
 4. [Installation](#installation)
 5. [Mullvad WireGuard setup](#mullvad-wireguard-setup)
 6. [Usage](#usage)
-7. [qBittorrent: secondary interface binding](#qbittorrent-secondary-interface-binding)
-8. [Runtime layout and configuration](#runtime-layout-and-configuration)
-9. [Testing](#testing)
-10. [Troubleshooting](#troubleshooting)
-11. [Security notes](#security-notes)
-12. [Uninstallation](#uninstallation)
+7. [Inter-Namespace Service Bridging (socat)](#inter-namespace-service-bridging-socat)
+8. [qBittorrent: secondary interface binding](#qbittorrent-secondary-interface-binding)
+9. [Runtime layout and configuration](#runtime-layout-and-configuration)
+10. [Testing](#testing)
+11. [Troubleshooting](#troubleshooting)
+12. [Security notes](#security-notes)
+13. [Uninstallation](#uninstallation)
 
 ---
 
@@ -49,7 +50,7 @@ $ mullrun --kill
  │  │  - registers PID    │                              │ exclusive     │
  │  │  - waits for app    │                     ┌────────┴───────────┐   │
  │  └─────────┬───────────┘                     │ detached supervisor │   │
- │            │ sudo -n wgc exec <vpn> ...      │ - probes ref lock   │   │
+ │            │ sudo -n wgc exec <vpn> <cmd>    │ - probes ref lock   │   │
  │            ▼                                 │ - reads netns PIDs  │   │
  │  ┌──────────────────────────────────────┐    │ - grace timer       │   │
  │  │ wgc_<vpn> network namespace          │    │ - wgc down / kill   │   │
@@ -101,7 +102,7 @@ hard IPv6 guarantee, either:
 - confirm that the profile has no IPv6 address/route and that `ip -6 route`
   inside the namespace is empty; or
 - disable IPv6 for the Mullvad device in the Mullvad account settings, or
-  explicitly test with `mullrun curl -6 ...` and verify failure.
+  explicitly test with `mullrun curl -6 https://ifconfig.co` and verify failure.
 
 Use `mullrun sh -c 'ip -brief address; ip route; ip -6 route'` to inspect what
 the application can actually see.
@@ -241,7 +242,8 @@ socat procps-ng
 ```
 
 It then installs `wgc` from the official upstream URL, installs
-`/usr/local/bin/mullrun`, creates `/etc/wireguard/wgc_enable`, and writes
+`/usr/local/bin/mullrun`, creates `/etc/wireguard/wgc_enable`, installs
+`/etc/mullrun/bridges.conf.example`, and writes
 `/etc/sudoers.d/mullrun-nopasswd` after validating it with `visudo -cf`.
 
 Your user must be in the `wheel` group:
@@ -285,10 +287,11 @@ leaves the old configuration untouched.
 ### Manual inspection after installation
 
 ```bash
-command -v mullrun wgc ip
+command -v mullrun wgc ip socat
 sudo visudo -cf /etc/sudoers.d/mullrun-nopasswd
 sudo /usr/local/bin/wgc req
-ls -ld /etc/wireguard
+ls -ld /etc/wireguard /etc/mullrun
+cat /etc/mullrun/bridges.conf.example
 ```
 
 ## Mullvad WireGuard setup
@@ -321,7 +324,7 @@ ls -ld /etc/wireguard
    A connected response looks like:
 
    ```text
-   You are connected to Mullvad (server ...). Your IP address is ...
+   You are connected to Mullvad (server <name>). Your IP address is <address>
    ```
 
 8. Compare with the host (only meaningful if the host is not already on a
@@ -406,6 +409,7 @@ Shows:
 - up time and exact kernel reference-lock count
 - supervisor PID and runtime path
 - `wgc state` connection details
+- **Active Bridges**: configured direction, state, relay PIDs, and endpoints
 - formatted PIDs in the namespace
 - per-client reference records
 
@@ -419,10 +423,11 @@ mullrun --kill
 mullrun --kill -v office
 ```
 
-`--kill` stops the supervisor, calls `wgc kill` (which terminates every
-process in the namespace and removes the interface/namespace), verifies that
-the namespace is gone, and removes transient runtime state. It does not touch
-other VPN profiles or the host network.
+`--kill` stops the supervisor, terminates all bridge relays, calls `wgc kill`
+(which terminates every process in the namespace and removes the
+interface/namespace), verifies that the namespace is gone, and removes
+transient runtime state. It does not touch other VPN profiles or the host
+network.
 
 ### Grace period
 
@@ -437,6 +442,269 @@ VPN_RUN_GRACE_PERIOD=10 mullrun firefox
 The supervisor reads the latest grace value from the runtime state file; a new
 invocation updates it. `0` means "tear down as soon as the supervisor observes
 zero references and zero processes".
+
+## Inter-Namespace Service Bridging (socat)
+
+### Why a netns `127.0.0.1` is not the host `127.0.0.1`
+
+`CLONE_NEWNET` gives the namespace its own loopback interface and routing
+table. An application inside `wgc_mullvad` cannot connect to Jackett on the
+host at `127.0.0.1:9117`: inside the namespace that address belongs to the
+namespace's own loopback.
+
+mullrun bridges the two loopback worlds through the filesystem, which is shared
+across namespaces. `socat` relays carry bytes over a private Unix domain socket:
+
+```text
+host-to-netns (inward)
+  qBittorrent search plugin
+    -> 127.0.0.1:<netns_port> inside wgc_<vpn>
+    -> unprivileged socat listener in the namespace
+    -> Unix socket (mode 0600, in $XDG_RUNTIME_DIR/mullrun/bridges/<vpn>/)
+    -> unprivileged socat relay on the host
+    -> 127.0.0.1:<host_port> (for example Jackett)
+
+netns-to-host (outward)
+  host browser
+    -> 127.0.0.1:<host_port>
+    -> unprivileged socat listener on the host
+    -> Unix socket
+    -> unprivileged socat relay in the namespace
+    -> 127.0.0.1:<netns_port> (for example qBittorrent WebUI)
+```
+
+No `veth`, bridge, route, or iptables rule is created between the host and the
+namespace. The namespace's only network path is still the WireGuard interface;
+the Unix socket is a filesystem conduit, not a network route.
+
+Both relay processes run as the invoking user. The namespace-side relay is
+started with `wgc exec`, which drops root privileges with `setpriv` before
+`socat` runs.
+
+### Configuration locations and precedence
+
+Bridge definitions use INI syntax and are read from:
+
+1. `$XDG_CONFIG_HOME/mullrun/bridges.conf`
+   (or `~/.config/mullrun/bridges.conf`)
+2. `/etc/mullrun/bridges.conf`
+
+A section in the user file overrides a section with the same name in the system
+file. `/etc/mullrun/bridges.conf.example` is installed as a documented template;
+the installer never overwrites an existing `/etc/mullrun/bridges.conf`.
+
+```ini
+[jackett]
+vpn = mullvad
+direction = host-to-netns
+host_port = 9117
+netns_port = 9117
+host_addr = 127.0.0.1
+netns_addr = 127.0.0.1
+enabled = true
+
+[qbittorrent-webui]
+vpn = mullvad
+direction = netns-to-host
+host_port = 8080
+netns_port = 8080
+enabled = false
+```
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `vpn` | yes | Profile name, or `*` for all profiles |
+| `direction` | yes | `host-to-netns` or `netns-to-host` |
+| `host_port` | yes | Port on the host side (1–65535) |
+| `netns_port` | yes | Port inside the namespace (1–65535) |
+| `host_addr` | no | Host loopback address; default `127.0.0.1` |
+| `netns_addr` | no | Namespace loopback address; default `127.0.0.1` |
+| `enabled` | no | `true`/`false`; default `true` |
+| `unsafe` | no | Permit non-loopback addresses; default `false` |
+
+Addresses must be valid IPv4 or IPv6 loopback addresses. `0.0.0.0`, `::`, and
+external interface addresses are rejected unless the section explicitly sets
+`unsafe = true`. Avoid that override unless you have deliberately audited the
+exposure; it weakens the zero-leak model.
+
+### Jackett tutorial (host service available inside the VPN)
+
+1. Confirm Jackett is listening on host loopback:
+
+   ```bash
+   curl -fsS http://127.0.0.1:9117/ >/dev/null && echo "Jackett is up"
+   ```
+
+2. Create the per-user bridge configuration:
+
+   ```bash
+   mkdir -p ~/.config/mullrun
+   cat > ~/.config/mullrun/bridges.conf <<'EOF'
+   [jackett]
+   vpn = mullvad
+   direction = host-to-netns
+   host_port = 9117
+   netns_port = 9117
+   host_addr = 127.0.0.1
+   netns_addr = 127.0.0.1
+   enabled = true
+   EOF
+   ```
+
+3. Start or restart qBittorrent through mullrun:
+
+   ```bash
+   mullrun qbittorrent
+   ```
+
+   The bridge starts with the namespace. If the VPN is already running, the
+   supervisor reconciles bridge changes within its monitoring interval, or you
+   can restart the app after applying the configuration.
+
+4. Verify from inside the namespace:
+
+   ```bash
+   mullrun curl http://127.0.0.1:9117/
+   ```
+
+   This `curl` runs in the same `wgc_mullvad` namespace, so it exercises the
+   same path qBittorrent uses.
+
+5. In qBittorrent's search plugin configuration, use:
+
+   ```text
+   http://127.0.0.1:9117
+   ```
+
+   with your Jackett API key. No host IP, hostname, or route is needed.
+
+6. Inspect the bridge:
+
+   ```bash
+   mullrun --status
+   ```
+
+   The **Active Bridges** section shows the relay PIDs, direction, state, and
+   both endpoints.
+
+### Exposing qBittorrent WebUI to the host browser
+
+qBittorrent's WebUI listens inside the namespace. Enable an outward bridge:
+
+```ini
+[qbittorrent-webui]
+vpn = mullvad
+direction = netns-to-host
+host_port = 8080
+netns_port = 8080
+host_addr = 127.0.0.1
+netns_addr = 127.0.0.1
+enabled = true
+```
+
+Restart qBittorrent under mullrun and browse to:
+
+```text
+http://127.0.0.1:8080
+```
+
+The host listener is bound to loopback only. Ensure qBittorrent's WebUI is
+listening on the namespace loopback/port you configured; if it is disabled or
+bound to a different namespace address, the host connection will be refused.
+
+### Security model
+
+- **Loopback by default:** all TCP listeners bind `127.0.0.1` or `::1`.
+  Non-loopback requires an explicit `unsafe = true` per bridge.
+- **Private conduit:** sockets live in
+  `$XDG_RUNTIME_DIR/mullrun/bridges/<vpn>/`, directory mode `0700`, owned by the
+  invoking UID. Socket files are mode `0600`; symlinked paths are rejected.
+- **No privilege escalation:** both `socat` processes run as the unprivileged
+  user. `wgc exec` performs the namespace-side privilege drop.
+- **No route pollution:** mullrun never creates `veth` pairs, host routes, or
+  firewall rules for bridges. The namespace's data path remains WireGuard-only.
+- **Credential scope:** a bridge exposes only the configured loopback port to
+  processes that can access the user's runtime directory and namespace. It does
+  not bind a LAN interface.
+
+### Bridge lifecycle
+
+- Bridges are loaded from configuration when the namespace is brought up.
+- Both relay PIDs, start times, endpoints, and the socket path are written to
+  `state/<vpn>/bridges.json`.
+- The supervisor checks bridge health while applications are running and
+  restarts a missing or crashed configured bridge.
+- Teardown, `--kill`, emergency cleanup, and uninstall terminate relays with
+  `SIGTERM`, wait a short grace period, then use `SIGKILL`, unlink the socket,
+  and remove the transient bridge directory.
+- The supervisor explicitly excludes managed namespace-side relay PIDs from the
+  application PID set, so a bridge cannot prevent idle teardown.
+
+### Troubleshooting bridges
+
+**Port already in use**
+
+The bridge is skipped and the application still launches. `mullrun --status`
+shows an `error` state with the reason. Find the listener:
+
+```bash
+ss -ltnp 'sport = :9117'
+```
+
+Change `host_port` or `netns_port`, then restart the bridge/app. For inward
+bridges, the namespace-side port is the listener; it must be free inside
+`wgc_<vpn>`.
+
+**Host service is not running**
+
+The host-side relay can still listen, but a connection through the bridge will
+be refused. Verify on the host:
+
+```bash
+curl -fsS http://127.0.0.1:9117/ >/dev/null && echo up
+```
+
+**Configuration rejected**
+
+Run `mullrun --status` and read the warning. Common causes:
+
+- non-loopback `host_addr`/`netns_addr` without `unsafe = true`
+- port outside `1..65535`
+- invalid `direction`
+- unknown keys
+- group/world-writable or symlinked configuration file
+- malformed INI
+
+**Where are the logs?**
+
+```text
+/run/user/$(id -u)/mullrun/bridges/<vpn>/<bridge>.host.log
+/run/user/$(id -u)/mullrun/bridges/<vpn>/<bridge>.netns.log
+```
+
+The supervisor log at `/run/user/$(id -u)/mullrun/logs/<vpn>.log` records bridge
+starts, failures, restarts, and teardown.
+
+**Recovery**
+
+```bash
+mullrun --kill
+```
+
+This removes the namespace, bridge relays, sockets, and transient state. A new
+launch re-reads the configuration.
+
+### IPv6
+
+Use unbracketed IPv6 addresses in the INI file:
+
+```ini
+host_addr = ::1
+netns_addr = ::1
+```
+
+The generated socat addresses use the required `TCP6:[::1]:port` and
+`TCP6-LISTEN:port,bind=[::1]` syntax internally.
 
 ## qBittorrent: secondary interface binding
 
@@ -460,9 +728,10 @@ Native packages are simplest.
 
 ### Ports and incoming connections
 
-Port forwarding is configured in the Mullvad profile or via the `wgc` bridge
-syntax in `[WGC]`. If you expose a port from the namespace, use `wgc`'s bridge
-feature; do not add a host-side route into the namespace.
+For host-loopback access to a qBittorrent WebUI or another namespace service,
+use the mullrun socat bridge described above. Do not add a host route into the
+namespace. For WAN-side port forwarding defined in the Mullvad profile, use
+`wgc`'s `[WGC]` bridge feature; mullrun does not replace that mechanism.
 
 ## Runtime layout and configuration
 
@@ -475,12 +744,18 @@ Per-user runtime state lives under `$XDG_RUNTIME_DIR/mullrun` (normally
 │   ├── <profile>.ref.lock
 │   ├── <profile>.lifecycle.lock
 │   └── <profile>.supervisor.lock
+├── bridges/
+│   └── <profile>/           # transient; removed on teardown
+│       ├── <bridge>.sock    # Unix conduit, mode 0600
+│       ├── <bridge>.host.log
+│       └── <bridge>.netns.log
 ├── logs/
 │   └── <profile>.log
 └── state/
     └── <profile>/           # transient; removed on teardown
         ├── state.json
         ├── supervisor.pid
+        ├── bridges.json
         └── refs/
 ```
 
@@ -508,15 +783,16 @@ no WireGuard private keys; `wgc` hides secret material in its own output.
 | `VPN_RUN_DEBUG=1` | Verbose launcher diagnostics |
 | `TERM=dumb` | Disables colors automatically |
 
-`VPN_RUN_TEST_MODE`, `VPN_RUN_WGC`, `VPN_RUN_IP` and `VPN_RUN_RUNTIME_DIR` are
-test-harness hooks. They are only honored when `VPN_RUN_TEST_MODE=1` and never
-enable sudo. Do not set them in normal use.
+`VPN_RUN_TEST_MODE`, `VPN_RUN_WGC`, `VPN_RUN_IP`, `VPN_RUN_SOCAT`,
+`VPN_RUN_RUNTIME_DIR`, `VPN_RUN_BRIDGE_CONFIG_USER`, and
+`VPN_RUN_BRIDGE_CONFIG_SYSTEM` are test-harness hooks. They are only honored
+when `VPN_RUN_TEST_MODE=1` and never enable sudo. Do not set them in normal use.
 
 ## Testing
 
-The lifecycle test is hermetic: it uses fake `wgc` and `ip` binaries, a private
-temporary runtime directory, and no root, firewall changes, real namespaces, or
-network access.
+The lifecycle test is hermetic: it uses fake `wgc`, `ip`, and `socat` binaries,
+a private temporary runtime directory, and no root, firewall changes, real
+namespaces, or network access.
 
 ```bash
 ./tests/test_lifecycle.sh
@@ -534,6 +810,14 @@ It checks:
 - grace-period teardown
 - namespace reuse when a new app claims during the grace period
 - lock acquisition timeout behavior
+- bridge configuration parsing, loopback enforcement, and clear rejection of
+  invalid ports/directions/addresses
+- user-config-over-system-config precedence
+- bridge relay startup, socket/Directory permissions, status reporting, and
+  teardown when the namespace closes
+- supervisor immunity from managed bridge PIDs
+- bridge cleanup on `--kill`
+- non-fatal bridge startup failures such as host port conflicts
 - `--kill` cleanup
 - launcher `SIGKILL` with a surviving orphan app (PID-monitored teardown)
 - signal forwarding from the launcher to the application
@@ -568,7 +852,7 @@ Re-run `sudo ./install.sh` after adding the user to `wheel` and logging back in.
 The launcher deliberately uses `sudo -n` so background supervisors fail fast
 instead of hanging on a password prompt.
 
-### `wgc not found` or `wgc nup ... failed`
+### `wgc not found` or `wgc nup` failure
 
 Verify the installed path and its dependencies:
 
@@ -708,7 +992,7 @@ the tunnel and namespace routes. Do not add host routes into
 If a launcher reports:
 
 ```text
-Timed out waiting for reference lock ...
+Timed out waiting for reference lock
 ```
 
 another process is holding an exclusive lock or a supervisor is in a slow
@@ -747,7 +1031,7 @@ whole runtime directory, do it only after no `mullrun` process is running.
 Launch `mullrun` from the graphical session that owns the application. If you
 start it from a bare SSH shell, `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_*`, and
 `XDG_RUNTIME_DIR` may be absent; GUI applications will fail even though the
-tunnel is up. Use `mullrun curl ...` for headless checks.
+tunnel is up. Use `mullrun curl https://am.i.mullvad.net/connected` for headless checks.
 
 ## Security notes
 
@@ -767,6 +1051,9 @@ tunnel is up. Use `mullrun curl ...` for headless checks.
   your fork of this repository.
 - The upstream `wgc` project is licensed under GPL-3.0-or-later; this
   repository installs it as an external dependency.
+- Bridge relays bind loopback by default, use mode `0700` directories and mode
+  `0600` Unix sockets, and run as the invoking user on both sides. Explicit
+  `unsafe = true` is required for any non-loopback binding.
 - The lock files are intentionally retained on teardown to avoid inode-split
   locking races; `uninstall.sh` removes the runtime root only after stopping
   tracked supervisors/namespaces.
@@ -781,12 +1068,15 @@ The uninstaller:
 
 1. finds tracked supervisors from runtime state and from `/proc` even if a
    user runtime directory disappeared, then stops them;
-2. calls `wgc kill` for each tracked namespace (with a direct `ip netns del`
+2. terminates host and namespace-side `socat` bridge relay processes and cleans
+   transient bridge sockets/logs;
+3. calls `wgc kill` for each tracked namespace (with a direct `ip netns del`
    fallback);
-3. removes `/usr/local/bin/mullrun`;
-4. removes `/etc/sudoers.d/mullrun-nopasswd`;
-5. removes installer-managed `/etc/wireguard/wgc_enable` (only if marked);
-6. cleans `/run/user/*/mullrun/`.
+4. removes `/usr/local/bin/mullrun`;
+5. removes `/etc/sudoers.d/mullrun-nopasswd`;
+6. removes installer-managed `/etc/wireguard/wgc_enable` (only if marked);
+7. removes the example `/etc/mullrun/bridges.conf.example`, warns if a user
+   `/etc/mullrun/bridges.conf` remains, and cleans `/run/user/*/mullrun/`.
 
 It asks before removing `/usr/local/bin/wgc` (default: keep). If you keep the
 wgc script and plan to use it directly, recreate
@@ -799,5 +1089,6 @@ sudo ./uninstall.sh --remove-wgc
 sudo ./uninstall.sh --yes
 ```
 
-Packages and your WireGuard profiles under `/etc/wireguard` are intentionally
-left intact. Remove them manually if they are no longer needed.
+Packages, your WireGuard profiles under `/etc/wireguard`, and user bridge
+configuration under `/etc/mullrun/bridges.conf` are intentionally left intact.
+Remove them manually if they are no longer needed.

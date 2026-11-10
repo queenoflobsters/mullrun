@@ -3,9 +3,9 @@
 # =============================================================================
 # test_lifecycle.sh - hermetic lifecycle tests for bin/mullrun
 #
-# No root, real namespace, network access, or real wgc/ip is required.  Fake
-# wgc and ip binaries live in a private temporary directory and model the
-# namespace/refcount contract used by the launcher.
+# No root, real namespace, network access, or real wgc/ip/socat is required.
+# Fake wgc, ip, and socat binaries live in a private temporary directory and
+# model the namespace, refcount, and bridge contract used by the launcher.
 # =============================================================================
 set -Eeuo pipefail
 IFS=$' \t\n'
@@ -100,18 +100,43 @@ count_calls() {
     printf '%s\n' "${count:-0}"
 }
 
+free_port() {
+    python3 - <<'PYFREEPORT'
+import socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.bind(("127.0.0.1", 0))
+print(sock.getsockname()[1])
+sock.close()
+PYFREEPORT
+}
+
+socat_lines() {
+    local count
+    count=$(grep -c -- '' "$FAKE_STATE/socat.log" 2>/dev/null || true)
+    printf '%s\n' "${count:-0}"
+}
+
+bridge_pid() {
+    local file=$1 key=$2 value
+    value=$(grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9]*" "$file" 2>/dev/null | head -n 1 | grep -o '[0-9]*$' || true)
+    printf '%s\n' "$value"
+}
+
 new_case() {
     CASE="$SANDBOX/case-$1"
     rm -rf -- "$CASE"
-    mkdir -p "$CASE"/{run,home,xdg,fake/ns}
+    mkdir -p "$CASE"/{run,home,xdg,fake/ns,config/mullrun,etc/mullrun}
     chmod 700 "$CASE" "$CASE/run" "$CASE/xdg" "$CASE/home"
     export CASE
     export FAKE_STATE="$CASE/fake"
     export VPN_RUN_RUNTIME_DIR="$CASE/run"
     export HOME="$CASE/home"
     export XDG_RUNTIME_DIR="$CASE/xdg"
+    export XDG_CONFIG_HOME="$CASE/config"
+    export VPN_RUN_BRIDGE_CONFIG_USER="$CASE/config/mullrun/bridges.conf"
+    export VPN_RUN_BRIDGE_CONFIG_SYSTEM="$CASE/etc/mullrun/bridges.conf"
     export FAKE_NUP_DELAY=0
-    unset VPN_RUN_GRACE_PERIOD VPN_RUN_DEFAULT_VPN || true
+    unset VPN_RUN_GRACE_PERIOD VPN_RUN_DEFAULT_VPN VPN_RUN_SOCAT_FAIL || true
 }
 
 # ---------------------------------------------------------------------------
@@ -234,6 +259,98 @@ case "$cmd" in
 esac
 FAKE_WGC
 
+cat > "$MOCKBIN/socat" <<'FAKE_SOCAT'
+#!/usr/bin/env python3
+import os
+import signal
+import socket
+import sys
+import time
+
+state = os.environ.get("FAKE_STATE")
+if not state:
+    print("fake socat: FAKE_STATE is not set", file=sys.stderr)
+    raise SystemExit(2)
+args = sys.argv[1:]
+with open(os.path.join(state, "socat.log"), "a", encoding="utf-8") as fh:
+    fh.write("%d %s\n" % (os.getpid(), " ".join(args)))
+
+fail_match = os.environ.get("FAKE_SOCAT_FAIL", "")
+if fail_match and fail_match in " ".join(args):
+    print("fake socat: forced failure for %s" % fail_match, file=sys.stderr)
+    raise SystemExit(3)
+
+os.umask(0o077)
+listeners = []
+sockets = []
+
+
+def cleanup():
+    for sock in listeners:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    for path in sockets:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def stop(signum, _frame):
+    cleanup()
+    raise SystemExit(128 + signum)
+
+
+for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(signum, stop)
+
+for arg in args:
+    if arg.startswith("UNIX-LISTEN:"):
+        path = arg.split(":", 1)[1].split(",", 1)[0]
+        try:
+            if os.path.lexists(path):
+                os.unlink(path)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(path)
+            os.chmod(path, 0o600)
+            sock.listen(16)
+        except OSError as exc:
+            print("fake socat: unix bind %s failed: %s" % (path, exc), file=sys.stderr)
+            cleanup()
+            raise SystemExit(1)
+        listeners.append(sock)
+        sockets.append(path)
+    elif arg.startswith("TCP4-LISTEN:") or arg.startswith("TCP6-LISTEN:"):
+        family = socket.AF_INET6 if arg.startswith("TCP6-LISTEN:") else socket.AF_INET
+        body = arg.split(":", 1)[1]
+        port = int(body.split(",", 1)[0])
+        bind = "::1" if family == socket.AF_INET6 else "127.0.0.1"
+        for option in body.split(",")[1:]:
+            if option.startswith("bind="):
+                bind = option.split("=", 1)[1].strip("[]")
+        try:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock.bind((bind, port))
+            sock.listen(16)
+        except OSError as exc:
+            print("fake socat: tcp bind %s:%d failed: %s" % (bind, port, exc), file=sys.stderr)
+            cleanup()
+            raise SystemExit(1)
+        listeners.append(sock)
+
+if not listeners:
+    print("fake socat: no listener address found in %s" % " ".join(args), file=sys.stderr)
+    raise SystemExit(2)
+
+while True:
+    time.sleep(1)
+FAKE_SOCAT
+
 cat > "$APPBIN/envdump" <<'ENVDUMP'
 #!/usr/bin/env bash
 set -eu
@@ -258,12 +375,13 @@ set -eu
 tr '\0' '\n' < "/proc/$PPID/environ" > "${PROC_OUT:?PROC_OUT not set}"
 PROCDUMP
 
-chmod +x "$MOCKBIN/ip" "$MOCKBIN/wgc" "$APPBIN/envdump" "$APPBIN/firefox" "$APPBIN/procdump"
+chmod +x "$MOCKBIN/ip" "$MOCKBIN/wgc" "$MOCKBIN/socat" "$APPBIN/envdump" "$APPBIN/firefox" "$APPBIN/procdump"
 
 export PATH="$MOCKBIN:$APPBIN:$PATH"
 export VPN_RUN_TEST_MODE=1
 export VPN_RUN_WGC="$MOCKBIN/wgc"
 export VPN_RUN_IP="$MOCKBIN/ip"
+export VPN_RUN_SOCAT="$MOCKBIN/socat"
 export VPN_RUN_LOCK_TIMEOUT=3
 
 # ---------------------------------------------------------------------------
@@ -293,6 +411,21 @@ cleanup() {
             kill -TERM "$pid" 2>/dev/null || true
             kill -KILL "$pid" 2>/dev/null || true
         done < "$pidfile"
+    done
+    for logfile in "$SANDBOX"/case-*/fake/socat.log; do
+        [[ -f $logfile ]] || continue
+        while read -r pid _rest; do
+            [[ $pid =~ ^[0-9]+$ ]] || continue
+            kill -TERM "$pid" 2>/dev/null || true
+            kill -KILL "$pid" 2>/dev/null || true
+        done < "$logfile"
+    done
+    for pidfile in "$SANDBOX"/case-*/holder.pid; do
+        [[ -f $pidfile ]] || continue
+        pid=$(head -n 1 "$pidfile")
+        [[ $pid =~ ^[0-9]+$ ]] || continue
+        kill -TERM "$pid" 2>/dev/null || true
+        kill -KILL "$pid" 2>/dev/null || true
     done
     rm -rf -- "$SANDBOX"
 }
@@ -334,7 +467,7 @@ test_cli() {
     assert_contains "$CASE/help" "wgc_mullvad"
 
     "$VPN_RUN" --version > "$CASE/version" 2>&1
-    assert_contains "$CASE/version" "mullrun 1.0.0"
+    assert_contains "$CASE/version" "mullrun 1.1.0"
 
     if "$VPN_RUN" > "$CASE/noargs" 2>&1; then
         return 1
@@ -472,6 +605,211 @@ test_grace_reuse() {
     wait_for 8 test ! -d "$ns"
     assert_equal "$(count_calls "^nup $vpn")" "1" "nup calls"
     assert_equal "$(count_calls "^down $vpn")" "1" "down calls"
+}
+
+test_bridge_config_validation() {
+    new_case bridgecfg
+    cat > "$VPN_RUN_BRIDGE_CONFIG_USER" <<'EOF'
+[bad-address]
+vpn = mullvad
+direction = host-to-netns
+host_port = 39117
+netns_port = 39118
+host_addr = 0.0.0.0
+enabled = true
+
+[bad-port]
+vpn = mullvad
+direction = host-to-netns
+host_port = 39119
+netns_port = 70000
+enabled = true
+
+[bad-direction]
+vpn = mullvad
+direction = sideways
+host_port = 39121
+netns_port = 39122
+enabled = true
+EOF
+    "$VPN_RUN" --status > "$CASE/status" 2>&1
+    assert_contains "$CASE/status" "Active Bridges"
+    assert_contains "$CASE/status" "refusing non-loopback host_addr"
+    assert_contains "$CASE/status" "netns_port must be between 1 and 65535"
+    assert_contains "$CASE/status" "direction must be 'host-to-netns' or 'netns-to-host'"
+
+    cat > "$VPN_RUN_BRIDGE_CONFIG_SYSTEM" <<'EOF'
+[precedence]
+vpn = mullvad
+direction = host-to-netns
+host_port = 1111
+netns_port = 1112
+enabled = true
+EOF
+    cat > "$VPN_RUN_BRIDGE_CONFIG_USER" <<'EOF'
+[precedence]
+vpn = mullvad
+direction = host-to-netns
+host_port = 3333
+netns_port = 3334
+enabled = true
+EOF
+    "$VPN_RUN" --status > "$CASE/precedence" 2>&1
+    assert_contains "$CASE/precedence" "127.0.0.1:3333"
+    assert_not_contains "$CASE/precedence" "127.0.0.1:1111"
+
+    cat > "$VPN_RUN_BRIDGE_CONFIG_USER" <<'EOF'
+[unsafe]
+vpn = mullvad
+direction = host-to-netns
+host_port = 39123
+netns_port = 39124
+host_addr = 0.0.0.0
+unsafe = true
+enabled = false
+EOF
+    "$VPN_RUN" --status > "$CASE/unsafe" 2>&1
+    assert_not_contains "$CASE/unsafe" "refusing non-loopback host_addr"
+    assert_contains "$CASE/unsafe" "disabled"
+}
+
+test_bridge_lifecycle() {
+    new_case bridgelife
+    local vpn=mullvad
+    local ns host_port netns_port
+    ns=$(ns_dir "$vpn")
+    host_port=$(free_port)
+    netns_port=$(free_port)
+    while [[ $netns_port == "$host_port" ]]; do netns_port=$(free_port); done
+    cat > "$VPN_RUN_BRIDGE_CONFIG_USER" <<EOF
+[jackett]
+vpn = mullvad
+direction = host-to-netns
+host_port = $host_port
+netns_port = $netns_port
+host_addr = 127.0.0.1
+netns_addr = 127.0.0.1
+enabled = true
+EOF
+
+    "$VPN_RUN" -v "$vpn" --grace "$GRACE" sleep 2 > "$CASE/app.log" 2>&1 &
+    local launcher=$!
+    wait_for 8 test -d "$ns"
+    local state="$CASE/run/state/$vpn/bridges.json"
+    local socket="$CASE/run/bridges/$vpn/jackett.sock"
+    wait_for 8 test -f "$state"
+    wait_for 8 test -S "$socket"
+    if (( $(socat_lines) < 2 )); then
+        printf '# expected at least two socat relay processes, got %s\n' "$(socat_lines)" >&2
+        return 1
+    fi
+    local host_pid netns_pid
+    host_pid=$(bridge_pid "$state" host_pid)
+    netns_pid=$(bridge_pid "$state" netns_pid)
+    test -n "$host_pid"
+    test -n "$netns_pid"
+    kill -0 "$host_pid"
+    kill -0 "$netns_pid"
+    assert_file_mode "$CASE/run/bridges/$vpn" "700"
+    assert_file_mode "$socket" "600"
+
+    "$VPN_RUN" -v "$vpn" --status > "$CASE/status" 2>&1
+    assert_contains "$CASE/status" "Active Bridges"
+    assert_contains "$CASE/status" "jackett"
+    assert_contains "$CASE/status" "host-to-netns"
+    assert_contains "$CASE/status" "running"
+    assert_contains "$CASE/status" "host=$host_pid"
+    assert_contains "$CASE/status" "netns=$netns_pid"
+    assert_contains "$CASE/status" "127.0.0.1:$host_port"
+    assert_contains "$CASE/status" "127.0.0.1:$netns_port"
+
+    wait "$launcher"
+    wait_for 10 test ! -d "$ns"
+    wait_for 5 test ! -e "/proc/$host_pid"
+    wait_for 5 test ! -e "/proc/$netns_pid"
+    test ! -e "$socket"
+    test ! -d "$CASE/run/bridges/$vpn"
+    test ! -f "$state"
+    assert_equal "$(count_calls "^down $vpn")" "1" "down calls"
+}
+
+test_bridge_kill() {
+    new_case bridgekill
+    local vpn=bridgekill
+    local ns host_port netns_port
+    ns=$(ns_dir "$vpn")
+    host_port=$(free_port)
+    netns_port=$(free_port)
+    while [[ $netns_port == "$host_port" ]]; do netns_port=$(free_port); done
+    cat > "$VPN_RUN_BRIDGE_CONFIG_USER" <<EOF
+[webui]
+vpn = $vpn
+direction = netns-to-host
+host_port = $host_port
+netns_port = $netns_port
+host_addr = 127.0.0.1
+netns_addr = 127.0.0.1
+enabled = true
+EOF
+
+    "$VPN_RUN" -v "$vpn" --grace 30 sleep 30 > "$CASE/app.log" 2>&1 &
+    local launcher=$!
+    wait_for 8 test -d "$ns"
+    local state="$CASE/run/state/$vpn/bridges.json"
+    wait_for 8 test -f "$state"
+    local host_pid netns_pid
+    host_pid=$(bridge_pid "$state" host_pid)
+    netns_pid=$(bridge_pid "$state" netns_pid)
+    test -n "$host_pid"
+    test -n "$netns_pid"
+    kill -0 "$host_pid"
+    kill -0 "$netns_pid"
+
+    "$VPN_RUN" -v "$vpn" --kill > "$CASE/kill.out" 2>&1
+    wait_for 8 test ! -d "$ns"
+    wait_for 5 test ! -e "/proc/$host_pid"
+    wait_for 5 test ! -e "/proc/$netns_pid"
+    test ! -d "$CASE/run/bridges/$vpn"
+    test ! -f "$state"
+    assert_equal "$(count_calls "^kill $vpn")" "1" "kill calls"
+    wait "$launcher" || true
+}
+
+test_bridge_port_conflict() {
+    new_case bridgeport
+    local vpn=bridgeport
+    local host_port netns_port holder
+    host_port=$(free_port)
+    netns_port=$(free_port)
+    while [[ $netns_port == "$host_port" ]]; do netns_port=$(free_port); done
+    python3 -c '
+import socket, sys, time
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(("127.0.0.1", int(sys.argv[1])))
+sock.listen(1)
+time.sleep(15)
+' "$host_port" &
+    holder=$!
+    printf '%s\n' "$holder" > "$CASE/holder.pid"
+    sleep 0.2
+    cat > "$VPN_RUN_BRIDGE_CONFIG_USER" <<EOF
+[webui]
+vpn = $vpn
+direction = netns-to-host
+host_port = $host_port
+netns_port = $netns_port
+enabled = true
+EOF
+
+    "$VPN_RUN" -v "$vpn" --grace 0 sleep 1 > "$CASE/app.log" 2>&1
+    assert_contains "$CASE/app.log" "already in use"
+    assert_contains "$CASE/app.log" "Bridge 'webui' unavailable"
+    wait_for 6 test ! -d "$(ns_dir "$vpn")"
+    test ! -d "$CASE/run/bridges/$vpn"
+    kill -TERM "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    rm -f -- "$CASE/holder.pid"
 }
 
 test_kill() {
@@ -638,6 +976,10 @@ run_test "single app lifecycle and grace teardown" test_single_lifecycle
 run_test "concurrent refcount and single nup" test_concurrent_refcount
 run_test "reference lock timeout" test_lock_timeout
 run_test "new claim during grace reuses namespace" test_grace_reuse
+run_test "bridge configuration validation" test_bridge_config_validation
+run_test "bridge lifecycle and supervisor immunity" test_bridge_lifecycle
+run_test "bridge cleanup on --kill" test_bridge_kill
+run_test "bridge port conflict is non-fatal" test_bridge_port_conflict
 run_test "force kill cleanup" test_kill
 run_test "launcher kill -9 leaves orphan supervised" test_launcher_crash
 run_test "launcher signal forwarding" test_signal_forwarding

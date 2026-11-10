@@ -13,6 +13,8 @@ SUDOERS_FILE="/etc/sudoers.d/mullrun-nopasswd"
 WG_DIR="/etc/wireguard"
 WG_CONFIG="$WG_DIR/mullvad.conf"
 WGC_ENABLE="$WG_DIR/wgc_enable"
+BRIDGE_DIR="/etc/mullrun"
+BRIDGE_EXAMPLE="$BRIDGE_DIR/bridges.conf.example"
 WGC_URL="https://raw.githubusercontent.com/colemar/wgc/main/wgc"
 WGC_ENABLE_MARKER="# Managed by mullrun/mullrun install.sh - do not remove while wgc is in use."
 
@@ -43,6 +45,10 @@ Installs:
   - /usr/local/bin/wgc from $WGC_URL (if not already installed)
   - /usr/local/bin/mullrun
   - $SUDOERS_FILE for the wheel group (wgc and ip only)
+  - $BRIDGE_EXAMPLE (documented socat bridge template)
+
+Copy $BRIDGE_EXAMPLE to /etc/mullrun/bridges.conf for system-wide bridges,
+or create ~/.config/mullrun/bridges.conf for per-user bridges.
 
 After installation, place a Mullvad WireGuard profile at:
   $WG_CONFIG   (mode 0600)
@@ -121,7 +127,7 @@ case "$PACKAGE_MANAGER" in
         ;;
 esac
 
-for required in bash curl flock ip python3 sed stat sudo visudo; do
+for required in bash curl flock ip python3 sed socat stat sudo visudo; do
     command -v "$required" >/dev/null 2>&1 || die "Required command missing after package installation: $required"
 done
 python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' \
@@ -180,6 +186,66 @@ if (( (8#$(stat -c '%a' "$WGC_BIN") & 022) != 0 )); then
 fi
 grep -q 'exec_in_namespace' "$WGC_BIN" || die "wgc does not provide the required 'exec' support."
 "$WGC_BIN" req || warn "wgc dependency self-check reported problems; review its output above."
+
+# ---------------------------------------------------------------------------
+# Bridge configuration template
+# ---------------------------------------------------------------------------
+if [[ -e "$BRIDGE_DIR" && ! -d "$BRIDGE_DIR" ]]; then
+    die "$BRIDGE_DIR exists but is not a directory."
+fi
+[[ ! -L "$BRIDGE_DIR" ]] || die "Refusing symlinked bridge configuration directory: $BRIDGE_DIR"
+install -d -o root -g root -m 0755 "$BRIDGE_DIR"
+if [[ -f "$BRIDGE_DIR/bridges.conf" ]]; then
+    [[ ! -L "$BRIDGE_DIR/bridges.conf" ]] || die "Refusing symlinked system bridge configuration."
+    chown root:root "$BRIDGE_DIR/bridges.conf"
+    chmod 0644 "$BRIDGE_DIR/bridges.conf"
+    info "Using existing system bridge configuration: $BRIDGE_DIR/bridges.conf"
+fi
+[[ ! -L "$BRIDGE_EXAMPLE" ]] || die "Refusing symlinked bridge template: $BRIDGE_EXAMPLE"
+cat > "$BRIDGE_EXAMPLE" <<'BRIDGE_EXAMPLE_EOF'
+# mullrun socat bridge configuration
+#
+# Copy this file to one of:
+#   ~/.config/mullrun/bridges.conf   (per-user; highest precedence)
+#   /etc/mullrun/bridges.conf        (system-wide; root-owned, mode 0644)
+#
+# Both sides of a bridge run as the unprivileged invoking user.  Network
+# relays bind loopback by default.  A non-loopback address is rejected unless
+# the section explicitly sets unsafe = true.
+#
+# direction = host-to-netns:
+#   app in the namespace connects to netns_addr:netns_port
+#   -> Unix socket -> host_addr:host_port on the host.
+#
+# direction = netns-to-host:
+#   app on the host connects to host_addr:host_port
+#   -> Unix socket -> netns_addr:netns_port inside the namespace.
+
+[jackett]
+# Match one VPN profile, or use "*" for every profile.
+vpn = mullvad
+direction = host-to-netns
+host_port = 9117
+netns_port = 9117
+host_addr = 127.0.0.1
+netns_addr = 127.0.0.1
+enabled = false
+
+[qbittorrent-webui]
+vpn = mullvad
+direction = netns-to-host
+host_port = 8080
+netns_port = 8080
+host_addr = 127.0.0.1
+netns_addr = 127.0.0.1
+enabled = false
+BRIDGE_EXAMPLE_EOF
+chown root:root "$BRIDGE_EXAMPLE"
+chmod 0644 "$BRIDGE_EXAMPLE"
+if command -v restorecon >/dev/null 2>&1; then
+    restorecon -F "$BRIDGE_DIR" "$BRIDGE_EXAMPLE" 2>/dev/null || true
+fi
+info "Installed bridge configuration template: $BRIDGE_EXAMPLE"
 
 # ---------------------------------------------------------------------------
 # mullrun
@@ -279,6 +345,12 @@ else
 EOF
 fi
 
+if [[ -f /etc/mullrun/bridges.conf ]]; then
+    info "Found system bridge configuration: /etc/mullrun/bridges.conf"
+else
+    info "Bridge template: $BRIDGE_EXAMPLE (inactive until copied and enabled)"
+fi
+
 if command -v getenforce >/dev/null 2>&1 && [[ $(getenforce 2>/dev/null || true) == "Enforcing" ]]; then
     warn "SELinux is enforcing. If wgc/ip is denied, inspect 'sudo ausearch -m avc -ts recent'."
     warn "Do not disable SELinux permanently; see README.md for safe diagnosis."
@@ -304,6 +376,12 @@ Quick start:
   $INSTALL_BIN qbittorrent
   $INSTALL_BIN firefox
   $INSTALL_BIN curl https://am.i.mullvad.net/connected
+  $INSTALL_BIN --status        # includes the Active Bridges section
+
+Bridge setup:
+  mkdir -p ~/.config/mullrun
+  cp $BRIDGE_EXAMPLE ~/.config/mullrun/bridges.conf
+  # edit and set enabled = true, then restart the VPN app
 
 The namespace created by wgc is named wgc_<profile> (for example wgc_mullvad).
 Uninstall with: sudo $SCRIPT_DIR/uninstall.sh

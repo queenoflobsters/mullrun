@@ -9,6 +9,9 @@ SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
 INSTALL_BIN="/usr/local/bin/mullrun"
 WGC_BIN="/usr/local/bin/wgc"
 SUDOERS_FILE="/etc/sudoers.d/mullrun-nopasswd"
+BRIDGE_DIR="/etc/mullrun"
+BRIDGE_CONFIG="$BRIDGE_DIR/bridges.conf"
+BRIDGE_EXAMPLE="$BRIDGE_DIR/bridges.conf.example"
 WG_ENABLE="/etc/wireguard/wgc_enable"
 WG_ENABLE_MARKER="# Managed by mullrun install.sh"
 VPN_RE='^[A-Za-z0-9_-]{1,16}$'
@@ -39,8 +42,9 @@ Usage: sudo ./uninstall.sh [--yes] [--keep-wgc|--remove-wgc]
   --remove-wgc   Remove /usr/local/bin/wgc without asking
   --help         Show this help
 
-This stops namespaces tracked by mullrun, removes /usr/local/bin/mullrun,
-removes $SUDOERS_FILE, and cleans /run/user/*/mullrun.
+This stops bridge relays and namespaces tracked by mullrun, removes
+/usr/local/bin/mullrun, removes $SUDOERS_FILE, and cleans
+/run/user/*/mullrun.  User bridge configuration in /etc/mullrun is left alone.
 EOF
 }
 
@@ -110,6 +114,46 @@ stop_namespace() {
     stopped_any=1
 }
 
+stop_bridge_relays() {
+    local json pid proc_dir cmdline
+    local -a bridge_pids=()
+    local -A seen=()
+    for json in /run/user/*/mullrun/state/*/bridges.json; do
+        [[ -f $json ]] || continue
+        while IFS= read -r pid; do
+            [[ $pid =~ ^[0-9]+$ ]] || continue
+            (( pid > 0 )) || continue
+            [[ -r "/proc/$pid/cmdline" ]] || continue
+            cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+            [[ $cmdline == *"/mullrun/bridges/"* && $cmdline == *"socat"* ]] || continue
+            seen[$pid]=1
+        done < <(
+            grep -oE '"(host_pid|netns_pid)"[[:space:]]*:[[:space:]]*[0-9]+' "$json" | grep -oE '[0-9]+$' || true
+        )
+    done
+    for proc_dir in /proc/[0-9]*; do
+        [[ -d $proc_dir ]] || continue
+        pid=${proc_dir##*/}
+        [[ $pid =~ ^[0-9]+$ ]] || continue
+        [[ -r "$proc_dir/cmdline" ]] || continue
+        cmdline=$(tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null || true)
+        [[ $cmdline == *"/mullrun/bridges/"* && $cmdline == *"socat"* ]] || continue
+        seen[$pid]=1
+    done
+    for pid in "${!seen[@]}"; do
+        bridge_pids+=("$pid")
+    done
+    (( ${#bridge_pids[@]} > 0 )) || return 0
+    info "Stopping ${#bridge_pids[@]} socat bridge relay process(es)..."
+    for pid in "${bridge_pids[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    sleep 0.5
+    for pid in "${bridge_pids[@]}"; do
+        kill -KILL "$pid" 2>/dev/null || true
+    done
+}
+
 # Find supervisors even if their user's runtime state directory disappeared.
 for proc_dir in /proc/[0-9]*; do
     [[ -d $proc_dir ]] || continue
@@ -173,8 +217,15 @@ for log_file in /run/user/*/mullrun/logs/*.log; do
     tracked_vpns[$vpn]=1
 done
 
+stop_bridge_relays
+
 for vpn in "${!tracked_vpns[@]}"; do
     stop_namespace "$vpn"
+done
+
+for bridge_root in /run/user/*/mullrun/bridges; do
+    [[ -e $bridge_root ]] || continue
+    rm -rf -- "$bridge_root"
 done
 
 for run_root in /run/user/*/mullrun; do
@@ -199,6 +250,25 @@ fi
 if [[ -f $WG_ENABLE ]] && grep -qF "$WG_ENABLE_MARKER" "$WG_ENABLE"; then
     info "Removing installer-managed wgc approval file: $WG_ENABLE"
     rm -f -- "$WG_ENABLE"
+fi
+
+# ---------------------------------------------------------------------------
+# Bridge configuration
+# ---------------------------------------------------------------------------
+if [[ -L $BRIDGE_DIR ]]; then
+    warn "Refusing to clean symlinked bridge configuration directory: $BRIDGE_DIR"
+elif [[ -d $BRIDGE_DIR ]]; then
+    if [[ -f $BRIDGE_CONFIG ]]; then
+        warn "Leaving user bridge configuration in place: $BRIDGE_CONFIG"
+    fi
+    if [[ -f $BRIDGE_EXAMPLE ]]; then
+        rm -f -- "$BRIDGE_EXAMPLE"
+    fi
+    if [[ -d $BRIDGE_DIR ]] && [[ -z "$(ls -A "$BRIDGE_DIR" 2>/dev/null || true)" ]]; then
+        rmdir "$BRIDGE_DIR" 2>/dev/null || true
+    elif [[ -d $BRIDGE_DIR ]]; then
+        warn "Other files remain in $BRIDGE_DIR; review and remove them manually."
+    fi
 fi
 
 # ---------------------------------------------------------------------------
