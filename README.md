@@ -305,7 +305,6 @@ cat /etc/mullrun/bridges.conf.example
 
    ```bash
    sudo install -d -o root -g root -m 0755 /etc/wireguard
-   sudo chmod o+rx
    sudo install -o root -g root -m 0600 ./co-cit-wg-001.conf /etc/wireguard/mullvad.conf
    sudo chmod 600 /etc/wireguard/mullvad.conf
    ```
